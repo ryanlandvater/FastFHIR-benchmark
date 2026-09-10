@@ -270,6 +270,110 @@ This pattern guarantees:
 
 ---
 
+## Recovery under corruption — what redundancy buys
+
+**Every arm now gets a real repair pass**, so this is no longer FastFHIR-with-
+recovery measured against competitors-without. The competitor recovery is built
+on what production actually does: HAPI's lenient-parse posture, Mirth's
+preprocessor resynchronisation on the 3-char HL7v2 segment header, and
+`jsonrepair`'s rule set for JSON. That makes the arms *stronger than production
+default*, which is the right direction — production engines mostly reject
+malformed input to an error queue rather than repair it.
+
+| arm | what its recovery does |
+|---|---|
+| `fastfhir` | **REPAIRS.** `FF_Recovery::recover()` diagnoses against on-wire witnesses (self-offset `VALIDATION`, the duplicated tuple tag), `apply()` rewrites into a copy |
+| `hl7v2` | resynchronises on the segment header, checks segment arity, then repairs the JSON inside ZFX payloads |
+| `json` / `ndjson` | resynchronises on a record marker, then repairs structurally |
+| `google_fhir` | TLV record resync only — **and see the caveat below** |
+
+### Two curves, because the delta is the finding
+
+Median % of content-verified leaves recovered, 20 replicates per point:
+
+| k | fastfhir | hl7v2 | ndjson | json | google_fhir |
+|---|---|---|---|---|---|
+| 256 | 99.8 | 95.0 | 91.1 | 80.1 | 75.1 |
+| 1024 | 98.2 | 79.8 | 70.6 | 54.8 | 29.9 |
+| 2048 | **95.9** | 72.4 | 55.2 | 37.8 | 16.1 |
+
+The same damaged bytes, read with recovery **OFF**:
+
+| k | fastfhir | hl7v2 | ndjson | json | google_fhir |
+|---|---|---|---|---|---|
+| 256 | 96.5 | 87.6 | 75.0 | **0.0** | 17.9 |
+| 1024 | 86.4 | 73.4 | 46.0 | **0.0** | 2.0 |
+| 2048 | **74.6** | 65.6 | 27.0 | **0.0** | 0.4 |
+
+**FastFHIR reads 74.6% of a badly damaged stream with recovery switched off.**
+That is the redundancy working in the ordinary read path, before any repair
+runs: a block whose `VALIDATION` word does not hold its own offset is simply not
+followed. JSON reads **0.0% at every damage level** — one flip anywhere breaks
+the whole-document parse, so everything it scores comes from the repair pass.
+Those are different kinds of resilience and only the two curves separate them.
+
+### The cost axis — the sharper finding
+
+Median wall time to recover, timed around the read only:
+
+| k | fastfhir | hl7v2 | ndjson | json |
+|---|---|---|---|---|
+| 1 | 63 ms | 35 ms | 36 ms | 46 ms |
+| 256 | 63 ms | 404 ms | 904 ms | 2,798 ms |
+| 2048 | **84 ms** | 645 ms | 2,509 ms | **5,638 ms** |
+
+**FastFHIR's recovery cost is flat across a 2000× damage range.** It checks
+witnesses that are already on the wire, so the work tracks the *stream*. The
+others have no redundancy to repair from, so their recovery is a **search** —
+resynchronise, then try candidate structural edits until one parses — and search
+cost tracks the *damage*: json rises 123×, ndjson 70×, hl7v2 19×.
+
+`fig9_recovery_cost` plots the honest single number, milliseconds per percentage
+point recovered, because wall time alone rewards an arm that fails fast and
+percentage alone hides its price.
+
+⚠ **protobuf is excluded from the cost figure.** It has no recovery mechanism
+and no recovery tooling — its parser validates *wire format only*, so corruption
+that leaves a message well-formed is undetectable by construction, and the
+ecosystem tools (protobuf-inspector, protoscope, blackboxprotobuf, protod)
+reverse-engineer unknown schemas rather than repair damaged bytes. The TLV
+resync in `arm_google_fhir_codec.hpp` is a heuristic this repo wrote so the arm
+would not be measured against nothing. Its recovery *percentage* stays in fig8;
+costing it would imply protobuf users pay that price for that benefit, and they
+do neither.
+
+### The NDJSON control — "JSON is fragile" was the wrong claim
+
+`ndjson` is a **control, not a competitor**. Its artifact is generated *from*
+`json.bin`, and both fingerprint to the identical digest (`3dfb8b1f…`, 34,839
+units). Same resources, same leaf paths (they share `json_leaf_walk.hpp`), same
+repair, same damage rule including the `\n` record separators. **Framing is the
+only variable.**
+
+| k | json ON | ndjson ON | json OFF | ndjson OFF |
+|---|---|---|---|---|
+| 1 | 99.9 | 100.0 | **0.0** | **99.9** |
+| 256 | 80.1 | 91.1 | 0.0 | 75.0 |
+| 2048 | 37.8 | **55.2** | 0.0 | **27.0** |
+
+Reframing alone is worth **+17.4 points at k=2048** with recovery, and without
+recovery it is the whole difference between 0.0% and 99.9% at k=1. NDJSON with
+*no repair at all* beats JSON *with* full repair up to k=128.
+
+So the supportable claim is **"single-document nesting is fragile", not "JSON is
+fragile"**. A JSON Bundle entry frames a whole resource in one brace-delimited
+object, so structural damage inside it costs the whole resource; NDJSON and
+HL7v2 both delimit records with a byte, so damage costs one record.
+
+### Caveat that must travel with these numbers
+
+hl7v2's figure is flattered by the ZFX encoding: **82.4% of the flips its damage
+model applies land on JSON punctuation inside ZFX payloads**, which this arm
+chunks into 13,295 independently-parsed fragments — finer damage isolation than
+a real ORU^R01, which packs far more into each OBX.
+
+---
+
 ## Concurrent build scaling
 
 **Thread count is part of parity, and it was not being controlled (fixed 2026-09-05).**
@@ -526,7 +630,8 @@ before them the harness emitted only nanoseconds:
 | `test_1_compact` | 0 | compact archive size (FastFHIR arm only — withheld unless the IN-E losslessness gate passes) |
 | `test_2_random_access` | 0 | id bytes read — the cross-arm parity accumulator (`ops` = reads) |
 | `test_2_compact` | 0 | id bytes read over the compact archive (FF arm only) |
-| `test_3_query` | 0 | 0 |
+| `test_3_query` | 0 | 0 — the 17-field census (full traversal) |
+| `test_3_selective` | 0 | 0 — the early-out 'find the cholesterol results' query |
 | `test_3_compact` | 0 | 0 — same census over the compact archive (FF arm only) |
 | `test_4_enrich` | source stream | enriched stream |
 | `test_4_compact` | — | **no row**: the API refuses to open a Builder on a compact archive (write-once, CAPI-10) |

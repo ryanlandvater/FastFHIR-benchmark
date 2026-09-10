@@ -204,6 +204,16 @@ ArmRunResult run_json_bundle(const BundleBenchFixture& fixture) {
   out.metrics.push_back({"json_fhir", Stage::Test3Query, test3_timer.stop_ns(),
                          /*bytes_in=*/0, /*bytes_out=*/0, /*ops=*/0,
                          /*entries=*/test_3::query_entries(query_summary)});
+  // SELECTIVE query -- see Stage::Test3Selective. Timed on its own so the
+  // early-out cost is not hidden inside the census above.
+  Timer test3s_timer;
+  test3s_timer.start();
+  const auto selective = test_3::query_selective(payload);
+  const std::int64_t test3s_ns = test3s_timer.stop_ns();
+  out.metrics.push_back({"json_fhir", Stage::Test3Selective, test3s_ns,
+                         /*bytes_in=*/0, /*bytes_out=*/0, /*ops=*/0,
+                         /*entries=*/static_cast<std::int64_t>(selective.scanned)});
+  out.selective_matches = static_cast<std::int64_t>(selective.matches);
   out.queried_value = test_3::format_query_summary(query_summary);
   out.query_loinc_matches =
       static_cast<std::int64_t>(query_summary.loinc_2085_9_matches);

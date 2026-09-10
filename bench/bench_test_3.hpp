@@ -71,6 +71,24 @@ struct QuerySummary {
   std::size_t obs_component_value_code = 0;
 };
 
+// A SELECTIVE query's answer: "find the cholesterol results".
+//
+// Deliberately tiny. The point of the stage is that a selective query should
+// touch almost nothing, so anything this struct demands is work every arm is
+// forced to do and the measurement is only honest if that work is the minimum
+// the question needs.
+struct SelectiveSummary {
+  std::size_t scanned = 0;   // records examined (the denominator)
+  std::size_t matches = 0;   // Observations carrying LOINC 2085-9
+  std::size_t values = 0;    // ... of those, how many had a value[x]
+};
+
+inline std::string format_selective_summary(const SelectiveSummary& s) {
+  return "scanned=" + std::to_string(s.scanned) +
+         " matches=" + std::to_string(s.matches) +
+         " values=" + std::to_string(s.values);
+}
+
 // The resources this query actually reached. An arm whose scanner misses a
 // segment returns FAST and returns FEW; without this the first is reported and
 // the second is not.
@@ -368,6 +386,76 @@ static inline QuerySummary query(std::string_view payload) {
   return acc.finalize();
 }
 
+// SELECTIVE query -- the shape a clinical system actually runs.
+//
+// Three questions, cheapest first, and a `continue` after each so a non-match
+// costs only the questions it failed:
+//   1. is this record an Observation?   -- the tuple's own RECOVERY_TAG, which
+//      is read from the parent slot WITHOUT dereferencing the block
+//   2. does it carry LOINC 2085-9?      -- code.coding[*], stopping at the
+//      first match
+//   3. only then, does it have a value? -- one slot read on the ~2% that match
+//
+// Nothing else is touched: no value-kind classification, no effective[x], no
+// issued, no components. That is the difference from query() above, whose
+// 17-field census cannot skip anything.
+static inline SelectiveSummary query_selective(std::string_view payload) {
+  SelectiveSummary out;
+
+  FastFHIR::Parser parser(payload.data(), payload.size());
+  const auto root_node = parser.root();
+  if (!(root_node && root_node.is<FastFHIR::RESOURCETYPE::BUNDLE>())) return out;
+  auto entries = root_node[TEST3_FF_BUNDLE_ENTRY];
+  if (!entries) return out;
+
+  for (auto& entry : entries.entries()) {
+    auto resource = entry[TEST3_FF_ENTRY_RESOURCE];
+    if (!resource) continue;
+    ++out.scanned;
+
+    // 1. Type, from the tag half of the 10-byte {offset, tag} tuple --
+    //    WITHOUT following the offset (upstream API-1,
+    //    Entry::concrete_recovery()). A non-Observation is rejected here and
+    //    its block is never touched.
+    //
+    //    Before API-1 this needed as_node() first, because
+    //    Entry::target_recovery carries the STATIC child_recovery for a
+    //    resource slot (RECOVER_FF_RESOURCE, the polymorphic base) and only a
+    //    choice slot resolved the runtime tag. That cost a dereference per
+    //    record to read something already sitting in the slot.
+    if (resource.concrete_recovery() != RECOVER_FF_OBSERVATION) continue;
+
+    auto resource_node = resource.as_node();
+    if (!resource_node) continue;
+
+    // 2. The code. First match wins; a miss ends this record.
+    bool matched = false;
+    if (auto code_entry = resource_node[FastFHIR::Fields::OBSERVATION::CODE]) {
+      auto cc = code_entry.as_node();
+      if (cc && cc.is_object()) {
+        if (auto coding_entry = cc[FastFHIR::Fields::CODEABLECONCEPT::CODING]) {
+          const auto n = coding_entry.size();
+          for (std::size_t i = 0; i < n && !matched; ++i) {
+            const auto coding = coding_entry[i];
+            std::string_view system_sv, code_sv;
+            if (auto sy = coding[FastFHIR::Fields::CODING::SYSTEM])
+              system_sv = sy.as<std::string_view>();
+            if (auto c = coding[FastFHIR::Fields::CODING::CODE])
+              code_sv = c.as<std::string_view>();
+            matched = detail::is_loinc_match(system_sv, code_sv);
+          }
+        }
+      }
+    }
+    if (!matched) continue;
+    ++out.matches;
+
+    // 3. Only the matches pay for this.
+    if (resource_node[FastFHIR::Fields::OBSERVATION::VALUE]) ++out.values;
+  }
+  return out;
+}
+
 #undef TEST3_FF_BUNDLE_ENTRY
 #undef TEST3_FF_ENTRY_RESOURCE
 
@@ -496,6 +584,58 @@ static inline QuerySummary query(const std::string& payload) {
   return acc.finalize();
 }
 
+// SELECTIVE query. Same three questions as the FastFHIR arm, same early-outs.
+//
+// The structural difference this stage exists to expose: simdjson must
+// MATERIALISE the document before the first question can be asked. The DOM
+// parse is unconditional and pays for every byte, including the ~98% of
+// records the query is about to reject. Early-out saves the field reads, not
+// the parse.
+static inline SelectiveSummary query_selective(const std::string& payload) {
+  SelectiveSummary out;
+  simdjson::dom::parser json_parser;
+  auto doc = json_parser.parse(payload);
+  if (doc.error()) return out;
+  auto entries = doc[TEST3_JSON_KEY_ENTRY];
+  if (!entries.is_array()) return out;
+
+  for (auto entry : entries) {
+    auto resource = entry[TEST3_JSON_KEY_RESOURCE];
+    if (!resource.is_object()) continue;
+    ++out.scanned;
+
+    auto res_type = resource[TEST3_JSON_KEY_RESOURCE_TYPE];
+    if (!res_type.is_string()) continue;
+    if (std::string_view(res_type.get_c_str().value_unsafe()) != "Observation") continue;
+
+    bool matched = false;
+    auto code = resource["code"];
+    if (code.is_object()) {
+      auto coding = code["coding"];
+      if (coding.is_array()) {
+        for (auto c : coding) {
+          if (!c.is_object()) continue;
+          auto sy = c["system"];
+          auto cd = c["code"];
+          std::string_view system_sv =
+              sy.is_string() ? std::string_view(sy.get_c_str().value_unsafe()) : std::string_view{};
+          std::string_view code_sv =
+              cd.is_string() ? std::string_view(cd.get_c_str().value_unsafe()) : std::string_view{};
+          if (detail::is_loinc_match(system_sv, code_sv)) { matched = true; break; }
+        }
+      }
+    }
+    if (!matched) continue;
+    ++out.matches;
+
+    if (resource["valueQuantity"].is_object() ||
+        resource["valueCodeableConcept"].is_object() ||
+        resource["valueString"].is_string() || resource["valueCode"].is_string())
+      ++out.values;
+  }
+  return out;
+}
+
 #undef TEST3_JSON_KEY_ENTRY
 #undef TEST3_JSON_KEY_RESOURCE
 #undef TEST3_JSON_KEY_RESOURCE_TYPE
@@ -603,6 +743,44 @@ static inline QuerySummary query(const std::string& payload) {
   return acc.finalize();
 }
 
+// SELECTIVE query. Protobuf's TLV framing lets the type byte reject a record
+// without ParseFromArray -- a genuine early-out, and the closest structural
+// analogue to FastFHIR's tag check. What it cannot skip is parsing the records
+// that ARE Observations, because a protobuf field is only reachable after the
+// message is decoded.
+static inline SelectiveSummary query_selective(const std::string& payload) {
+  SelectiveSummary out;
+  google::fhir::r4::core::Observation observation;
+
+  std::size_t pos = 0;
+  while (pos + 5 <= payload.size()) {
+    const char record_type = payload[pos];
+    const uint32_t record_len = decode_u32_le_t3(payload.data() + pos + 1);
+    pos += 5;
+    if (pos + record_len > payload.size()) break;
+    ++out.scanned;
+
+    if (record_type != 'O') { pos += record_len; continue; }  // type, pre-parse
+    if (!observation.ParseFromArray(payload.data() + pos, static_cast<int>(record_len))) {
+      pos += record_len;
+      continue;
+    }
+    pos += record_len;
+
+    bool matched = false;
+    for (const auto& coding : observation.code().coding()) {
+      if (detail::is_loinc_match(coding.system().value(), coding.code().value())) {
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) continue;
+    ++out.matches;
+    if (observation.has_value()) ++out.values;
+  }
+  return out;
+}
+
 #elif defined(ARM_HL7V2)
 
 static inline QuerySummary query(const std::string& payload) {
@@ -698,6 +876,37 @@ static inline QuerySummary query(const std::string& payload) {
   }
 
   return acc.finalize();
+}
+
+// SELECTIVE query. v2 has no record type to test before reading, so the
+// "is this an Observation" question is answered by the segment name -- which
+// is the same self-identifying-record property that made its recovery work.
+// A non-OBX line is rejected on three bytes.
+static inline SelectiveSummary query_selective(const std::string& payload) {
+  SelectiveSummary out;
+  std::size_t start = 0;
+  while (start < payload.size()) {
+    std::size_t end = payload.find('\r', start);
+    if (end == std::string::npos) end = payload.size();
+    const std::string_view seg(payload.data() + start, end - start);
+    start = end + 1;
+    if (seg.size() < 4) continue;
+    ++out.scanned;
+    if (seg.compare(0, 3, "OBX") != 0) continue;   // three bytes, no parse
+
+    // OBX-3 is the observation identifier (code^display^system). segment_field
+    // is 1-based INCLUDING the segment name, so OBX-3 is index 4 -- index 3 is
+    // OBX-2, the value type, which is why an earlier version matched nothing.
+    const std::string field3 = detail::segment_field(seg, 4);
+    const auto caret = field3.find('^');
+    const std::string_view code_sv =
+        caret == std::string::npos ? std::string_view(field3)
+                                   : std::string_view(field3).substr(0, caret);
+    if (code_sv != kCholesterolLoincCode) continue;
+    ++out.matches;
+    if (!detail::segment_field(seg, 6).empty()) ++out.values;  // OBX-5
+  }
+  return out;
 }
 
 #endif

@@ -776,12 +776,35 @@ int main(int argc, char **argv)
             for (const auto &a : arms)
               std::cerr << std::setw(14) << a.run->query_loinc_matches;
             std::cerr << "\n";
+            std::cerr << "  " << std::setw(22) << std::left
+                      << "test_3 SELECTIVE chol" << std::right;
+            for (const auto &a : arms)
+              std::cerr << std::setw(14) << a.run->selective_matches;
+            std::cerr << "\n";
             if (arms.front().run->test1_elements >= 0) {
               std::cerr << "  " << std::setw(22) << std::left
                         << "test_1 ELEMENTS" << std::right;
               for (const auto &a : arms)
                 std::cerr << std::setw(14) << a.run->test1_elements;
               std::cerr << "\n";
+            }
+          }
+
+          // SELECTIVE-QUERY PARITY. The whole point of Stage::Test3Selective is
+          // that an arm may skip work -- so the one thing that must be checked
+          // is that skipping did not skip the ANSWER. An arm that returns fast
+          // because it matched nothing is the failure mode, and a duration
+          // column cannot show it.
+          {
+            const std::int64_t ref = arms.front().run->selective_matches;
+            for (const auto &a : arms) {
+              if (a.run->selective_matches != ref) {
+                std::cerr << "[validate] test_3 SELECTIVE mismatch: "
+                          << arms.front().name << "=" << ref << " " << a.name
+                          << "=" << a.run->selective_matches
+                          << " -- the arms did not find the same results\n";
+                validation_failed = true;
+              }
             }
           }
 

@@ -5,6 +5,7 @@ cc_library(
     srcs = [
         "arm_fastfhir.cpp",
         "arm_json_fhir.cpp",
+        "arm_ndjson.cpp",
         "synthea_fixture.cpp",
     ],
     hdrs = [
@@ -13,7 +14,14 @@ cc_library(
         "bench_test_3.hpp",
         "bench_test_4.hpp",
         "bench_test_5.hpp",
+        "arm_fastfhir_codec.hpp",
+        "arm_google_fhir_codec.hpp",
+        "arm_hl7v2_codec.hpp",
+        "arm_json_codec.hpp",
+        "arm_ndjson_codec.hpp",
         "harness.hpp",
+        "json_leaf_walk.hpp",
+        "json_syntax_repair.hpp",
         "poco_leaves.hpp",
         "poco_set.hpp",
         "walk_diagnostic.hpp",

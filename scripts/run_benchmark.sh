@@ -288,6 +288,22 @@ fi
 
 # --- 4. recovery sweep -----------------------------------------------------
 if [[ "$DO_SWEEP" -eq 1 ]]; then
+# REC-6 control artifact: NDJSON, derived FROM json.bin so the two carry
+# byte-identical content and fingerprint to the same 34,839 units. Generated
+# here rather than by an arm in the harness, because the point of the control
+# is that nothing but the framing differs.
+if [[ "$DO_ARTIFACTS" -eq 1 && -f "$ARTIFACTS_DIR/json.bin" ]]; then
+  "$PYTHON" - "$ARTIFACTS_DIR" <<'PYEOF'
+import json, sys, pathlib
+d = pathlib.Path(sys.argv[1])
+doc = json.loads((d / "json.bin").read_text())
+lines = [json.dumps(e["resource"], separators=(",", ":"))
+         for e in doc.get("entry", []) if isinstance(e.get("resource"), dict)]
+(d / "ndjson.bin").write_text("\n".join(lines))
+print(f"  ndjson.bin  {len(lines):,} records", file=sys.stderr)
+PYEOF
+fi
+
   stage "4/5 recovery sweep -> results/recovery_curve.csv"
   [[ -x "$SWEEP_DRIVER" ]] || die "$SWEEP_DRIVER missing -- build first (drop --skip-build)"
   for arm in fastfhir json hl7v2 google_fhir; do

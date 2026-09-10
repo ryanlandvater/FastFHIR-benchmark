@@ -61,6 +61,9 @@ ARM_COLOR = {
     "json_fhir": "#eb6834",    # slot 2, orange
     "hl7v2": "#1baf7a",        # slot 3, aqua
     "google_fhir": "#eda100",  # slot 4, yellow
+    # REC-6 control. A lighter shade of the json orange on purpose: it IS the
+    # json arm's content, reframed, and the colour should say so.
+    "ndjson": "#f4a687",
 }
 ARM_LABEL = {
     "fastfhir": "FastFHIR",
@@ -81,7 +84,8 @@ WARN = "#c1462f"
 STAGES = [
     ("test_1_serialize", "Test 1 — serialize"),
     ("test_2_random_access", "Test 2 — random access"),
-    ("test_3_query", "Test 3 — query"),
+    ("test_3_query", "Test 3 — query (census)"),
+    ("test_3_selective", "Test 3 — selective query"),
     ("test_4_enrich", "Test 4 — enrich"),
 ]
 
@@ -92,8 +96,15 @@ CAVEAT_PARITY = (
 )
 CAVEAT_CHOICE = "value[x] is excluded from every arm (D2 / upstream CAPI-3): 95.1% of the corpus's choice values."
 CAVEAT_QUERY = (
-    "Test 3: the FastFHIR arm reads via node lenses (no whole-POCO materialization, 2026-08-26); "
+    "Test 3 (census) reads all 17 fields of every observation — no early-out — so it is a full traversal, "
+    "not the lens workload. The FastFHIR arm reads via node lenses (no whole-POCO materialization, 2026-08-26); "
     "the print_json penalty for packed date/time remains only on Patient.birthDate (PA-7 / CAPI-4)."
+)
+CAVEAT_SELECTIVE = (
+    "Test 3 (selective) is the lens workload: 'find the cholesterol (LOINC 2085-9) results'. "
+    "Each arm early-outs after the type/code test where its design allows — FastFHIR rejects on the entry tag, "
+    "HL7v2 on the segment name, while JSON still pays one unconditional simdjson parse inside the timed region. "
+    "Parity here is the ANSWER (scanned/matches/values), never the traversal."
 )
 CAVEAT_RA_GRANULARITY = (
     "Test 2 (random access) is not the same ordinal space in every arm: HL7v2 addresses "
@@ -489,14 +500,19 @@ def fig_duration_by_stage(df: pd.DataFrame, prov: Provenance, out: Path, exts: l
     produced 130 KB: the smaller request produced the larger bundle. Plotting
     against target_mb below ~4 MB plots against noise (TASKS.md CO-4).
 
-    Four stages on one linear axis would span four orders of magnitude; small
-    multiples keep each stage readable and never invite a dual axis.
+    The two Test 3 variants are separate panels, side by side: the census (17
+    fields of every observation, no early-out) next to the selective query (the
+    early-out lens workload). One linear axis would span four+ orders of
+    magnitude across stages; small multiples keep each stage readable and never
+    invite a dual axis.
     """
     df = with_compact_arm(df)
     arms = ordered_arms(df)
     size_key = bundle_size_key(df)
 
-    fig, axes = plt.subplots(2, 2, figsize=(10.5, 7.4), sharex=True)
+    n_cols = 2
+    n_rows = (len(STAGES) + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(10.5, 10.6), sharex=True)
     fig.suptitle("Stage duration vs actual bundle wire size", fontsize=12, y=0.985,
                  x=0.008, ha="left", color=TEXT_PRIMARY)
 
@@ -521,12 +537,17 @@ def fig_duration_by_stage(df: pd.DataFrame, prov: Provenance, out: Path, exts: l
             ax.spines[spine].set_visible(False)
         label_endpoints(ax, entries)
 
-    for ax in axes[1]:
+    # 5 stages fill 3 rows of 2; the trailing cell stays empty.
+    for ax in axes.flat[len(STAGES):]:
+        ax.set_axis_off()
+
+    for ax in axes[-1]:
         ax.set_xlabel("bundle wire size, JSON arm (KiB)")
 
     fig.tight_layout(rect=[0, 0.14, 1, 0.96])
     legend_for(fig, arms)
-    finish(fig, prov, [CAVEAT_PARITY, CAVEAT_RA_GRANULARITY, CAVEAT_QUERY, CAVEAT_CHOICE])
+    finish(fig, prov, [CAVEAT_PARITY, CAVEAT_RA_GRANULARITY, CAVEAT_QUERY,
+                       CAVEAT_SELECTIVE, CAVEAT_CHOICE])
     save(fig, out / "fig1_duration_by_stage", exts)
 
 
@@ -680,7 +701,9 @@ def fig_distribution(df: pd.DataFrame, prov: Provenance, out: Path, exts: list[s
     df = with_compact_arm(df)
     arms = ordered_arms(df)
     targets = sorted(df["target_mb"].unique())
-    fig, axes = plt.subplots(2, 2, figsize=(11.5, 7.6))
+    n_cols = 2
+    n_rows = (len(STAGES) + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(11.5, 11.0))
     fig.suptitle("Duration distribution across runs", fontsize=12, y=0.985, x=0.008,
                  ha="left", color=TEXT_PRIMARY)
 
@@ -717,12 +740,16 @@ def fig_distribution(df: pd.DataFrame, prov: Provenance, out: Path, exts: list[s
         for spine in ("top", "right"):
             ax.spines[spine].set_visible(False)
 
-    for ax in axes[1]:
+    # 5 stages fill 3 rows of 2; the trailing cell stays empty.
+    for ax in axes.flat[len(STAGES):]:
+        ax.set_axis_off()
+
+    for ax in axes[-1]:
         ax.set_xlabel("target bundle size — see PA-12: this controls nothing below ~4 MB")
 
     fig.tight_layout(rect=[0, 0.14, 1, 0.96])
     legend_for(fig, arms)
-    finish(fig, prov, [CAVEAT_PARITY, CAVEAT_CHOICE,
+    finish(fig, prov, [CAVEAT_PARITY, CAVEAT_SELECTIVE, CAVEAT_CHOICE,
                        "Violin width is a kernel density estimate over few samples — read the spread, not its shape."])
     save(fig, out / "fig5_distribution", exts)
 
@@ -859,6 +886,101 @@ def fig_random_access(df: pd.DataFrame, prov: Provenance, out: Path, exts: list[
     save(fig, out / "fig3_random_access", exts)
 
 
+def fig_recovery_cost(prov: Provenance, out: Path, exts: list[str]) -> None:
+    """REC-7: what a percentage point of recovery COSTS, per format.
+
+    Recovery percentage alone hides an operational difference of orders of
+    magnitude. FastFHIR repairs from redundancy already on the wire -- a bounded
+    diagnose-then-apply pass over blocks that vouch for themselves, so the work
+    tracks the STREAM. The others have no redundancy to repair from, so recovery
+    is a SEARCH: resynchronise on a record marker, then try candidate structural
+    edits until one parses. Search cost tracks the DAMAGE.
+
+    ONE axis, not two. Wall time alone rewards an arm that fails fast, and
+    percentage alone hides what the percentage cost. Dividing them is the honest
+    single number: milliseconds spent per percentage point actually recovered.
+    """
+    csv_path = Path("results/recovery_curve.csv")
+    if not csv_path.is_file():
+        print("  skip fig9: no results/recovery_curve.csv")
+        return
+    rc = pd.read_csv(csv_path)
+    if "recover_ns" not in rc.columns:
+        print("  skip fig9: curve predates the recover_ns column — re-run the sweep")
+        return
+    rc = rc[(rc["bits_corrupted"] > 0) & (rc["recover_ns"] > 0)].copy()
+    if rc.empty:
+        print("  skip fig9: no timed rows")
+        return
+    rc["density_pct"] = 100.0 * rc["bits_corrupted"] / rc["positions_total"]
+
+    # PROTOBUF IS EXCLUDED, DELIBERATELY.
+    #
+    # Costing recovery only means something when recovery is a thing the format
+    # does. Protobuf has no recovery mechanism and no recovery tooling: its
+    # parser validates WIRE FORMAT only, so corruption that leaves a message
+    # well-formed is undetectable by construction, and the ecosystem tools
+    # (protobuf-inspector, protoscope, blackboxprotobuf, protod) reverse-engineer
+    # unknown schemas rather than repair damaged bytes. The TLV resync in
+    # arm_google_fhir_codec.hpp is a heuristic this benchmark wrote so the arm
+    # would not be measured against nothing; it is not something a protobuf user
+    # has. Its recovery PERCENTAGE stays in fig8 -- that number is real for the
+    # code we run -- but a cost-per-recovery axis would imply protobuf users pay
+    # this price for this benefit, and they do neither. Its timings also FALL as
+    # damage rises (32 ms -> 9 ms at k=2048) because it gives up earlier, which
+    # on a cost axis reads as efficiency.
+    units = {"fastfhir": "FastFHIR", "hl7v2": "HL7v2",
+             "ndjson": "NDJSON (control)", "json": "JSON"}
+    colors = {k: arm_color("json_fhir" if k == "json" else k) for k in units}
+
+    fig, ax = plt.subplots(figsize=(10.0, 5.4))
+    fig.suptitle("Cost of recovery: milliseconds per percentage point recovered",
+                 fontsize=12, y=0.985, x=0.008, ha="left", color=TEXT_PRIMARY)
+
+    ends = []
+    for fmt, label in units.items():
+        sub = rc[rc["format"] == fmt]
+        if sub.empty:
+            continue
+        g = sub.groupby("density_pct")
+        xs = g["recover_ns"].median().index.to_numpy()
+        ms = g["recover_ns"].median().to_numpy() / 1e6
+        pct = g["recovered_pct"].median().to_numpy()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            eff = np.where(pct > 0, ms / pct, np.nan)
+        ax.plot(xs, eff, color=colors[fmt], lw=2, marker="o", ms=4, mec=SURFACE,
+                mew=1.2, label=label)
+        good = ~np.isnan(eff)
+        if good.any():
+            ends.append((xs[good][-1], eff[good][-1], label, colors[fmt]))
+
+    label_endpoints(ax, [(x, y, lab) for x, y, lab, _ in ends])
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("structural positions corrupted (%)")
+    ax.set_ylabel("ms per % recovered (log) — lower is better")
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    # No legend: the lines are labelled at their endpoints, and duplicating that
+    # in a box is the noise the house style avoids.
+
+    fig.tight_layout(rect=[0, 0.20, 1, 0.95])
+    finish(fig, prov, [
+        "Timed around the READ only: file I/O and fingerprint serialisation are outside the "
+        "window, so this is what the FORMAT costs to recover, not what the driver costs to run.",
+        "Dividing by the percentage actually recovered is what makes the arms comparable: wall "
+        "time alone rewards an arm that fails fast, and percentage alone hides its price.",
+        "Not the same work in every arm. FastFHIR REPAIRS from on-wire redundancy (FF_Recovery "
+        "diagnose + apply over self-validating blocks), so its cost tracks the stream and stays "
+        "flat. json, ndjson and hl7v2 resynchronise on a record marker and then SEARCH for a "
+        "structural edit that parses (bench/json_syntax_repair.hpp), so their cost tracks the damage.",
+        "protobuf is EXCLUDED: it has no recovery mechanism and no recovery tooling (its parser "
+        "validates wire format only), so there is no cost to report. Its recovery percentage "
+        "still appears in fig8.",
+    ])
+    save(fig, out / "fig9_recovery_cost", exts)
+
+
 def fig_recovery(prov: Provenance, out: Path, exts: list[str]) -> None:
     """Instrument G test 5: content-verified recovery vs damage density, per format.
 
@@ -884,12 +1006,14 @@ def fig_recovery(prov: Provenance, out: Path, exts: list[str]) -> None:
     units = {
         "fastfhir": "FastFHIR (block refs)",
         "json": "JSON (entries)",
+        "ndjson": "NDJSON (entries, one per line) — CONTROL",
         "google_fhir": "protobuf TLV (records)",
         "hl7v2": "HL7v2 (segments)",
     }
     colors = {
         "fastfhir": arm_color("fastfhir"),
         "json": arm_color("json_fhir"),
+        "ndjson": arm_color("ndjson"),
         "google_fhir": arm_color("google_fhir"),
         "hl7v2": arm_color("hl7v2"),
     }
@@ -1076,7 +1200,8 @@ def write_tables(df: pd.DataFrame, prov: Provenance, out: Path) -> None:
     if not prov.is_artifact:
         lines += [f"- {r}" for r in prov.why_not_artifact] + [""]
     lines += [f"`{prov.stamp()}`", "", "## Caveats carried on every figure", ""]
-    lines += [f"- {c}" for c in (CAVEAT_PARITY, CAVEAT_CHOICE, CAVEAT_RA_GRANULARITY, CAVEAT_QUERY, CAVEAT_ENRICH)]
+    lines += [f"- {c}" for c in (CAVEAT_PARITY, CAVEAT_CHOICE, CAVEAT_RA_GRANULARITY,
+                                 CAVEAT_QUERY, CAVEAT_SELECTIVE, CAVEAT_ENRICH)]
     lines += ["", "## Medians by stage and arm", ""]
     for stage, title in STAGES:
         sub = agg[agg["test"] == stage]
@@ -1198,6 +1323,7 @@ def main() -> int:
     fig_wire_size(df, prov, args.out, exts)
     fig_random_access(df, prov, args.out, exts)
     fig_recovery(prov, args.out, exts)
+    fig_recovery_cost(prov, args.out, exts)
     fig_compact_speed(df, prov, args.out, exts)
     fig_enrich_delta(df, prov, args.out, exts)
     fig_distribution(df, prov, args.out, exts)

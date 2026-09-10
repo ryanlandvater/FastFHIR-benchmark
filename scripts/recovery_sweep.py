@@ -56,6 +56,10 @@ ARTIFACTS = {
     "json": "artifacts/json.bin",
     "google_fhir": "artifacts/google_fhir.bin",
     "hl7v2": "artifacts/hl7v2.bin",
+    # REC-6 CONTROL, not a competitor. Same resources and byte-identical leaves
+    # as `json` (both fingerprint to 3dfb8b1f…), framed one record per line.
+    # It varies framing and nothing else, which is what makes it a control.
+    "ndjson": "artifacts/ndjson.bin",
 }
 KS = [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
 
@@ -115,7 +119,8 @@ def main() -> int:
         crashes.write("format,bits_corrupted,replicate,step,returncode\n")
         f.write("format,bits_corrupted,positions_total,replicate,recovered_pct,"
                 "no_recovery_pct,"
-                "baseline_count,recovered_count,correct,wrong,missing,spurious\n")
+                "baseline_count,recovered_count,correct,wrong,missing,spurious,"
+                "recover_ns,norec_ns\n")
         censuses: dict[str, int] = {}
         crashed_replicates = 0
         for fmt, artifact in ARTIFACTS.items():
@@ -148,6 +153,10 @@ def main() -> int:
                     pct, norec_pct = "0.0", "0.0"
                     rec_n = correct = wrong = spurious = "0"
                     missing = base_n
+                    # REC-7: what recovery COSTS. A crashed step leaves 0, which
+                    # reads as "no time spent" -- correct, since nothing was
+                    # recovered either.
+                    recover_ns = norec_ns = "0"
 
                     if replicate_step(fmt, k, t, "corrupt", crashes,
                                   ["--corrupt", fmt, "--bits", str(k), "--seed", str(seed),
@@ -155,9 +164,11 @@ def main() -> int:
                         crashed_replicates += 1
                     else:
                         # Recovery ON.
-                        if replicate_step(fmt, k, t, "recover", crashes,
+                        rec_line = replicate_step(fmt, k, t, "recover", crashes,
                                       ["--recover", fmt, "--in", str(damaged),
-                                       "--out", str(recovered)]) is not None:
+                                       "--out", str(recovered)])
+                        if rec_line is not None:
+                            recover_ns = field(rec_line, "recover_ns")
                             line = replicate_step(fmt, k, t, "check", crashes,
                                               ["--check", "--baseline", str(baseline),
                                                "--recovered", str(recovered)])
@@ -176,9 +187,11 @@ def main() -> int:
 
                         # Recovery OFF, on the SAME damaged bytes -- the sound
                         # comparison, shared denominator both sides.
-                        if replicate_step(fmt, k, t, "hash_norec", crashes,
+                        nr_line = replicate_step(fmt, k, t, "hash_norec", crashes,
                                       ["--hash", fmt, "--in", str(damaged),
-                                       "--out", str(no_recovery)]) is not None:
+                                       "--out", str(no_recovery)])
+                        if nr_line is not None:
+                            norec_ns = field(nr_line, "read_ns")
                             line_nr = replicate_step(fmt, k, t, "check_norec", crashes,
                                                  ["--check", "--baseline", str(baseline),
                                                   "--recovered", str(no_recovery)])
@@ -190,7 +203,8 @@ def main() -> int:
                             crashed_replicates += 1
 
                     f.write(f"{fmt},{k},{positions},{t},{pct},{norec_pct},{base_n},{rec_n},"
-                            f"{correct},{wrong},{missing},{spurious}\n")
+                            f"{correct},{wrong},{missing},{spurious},"
+                            f"{recover_ns},{norec_ns}\n")
                     f.flush()  # live rows: a crash must not swallow a day of replicates
                     damaged.unlink(missing_ok=True)
                     recovered.unlink(missing_ok=True)

@@ -54,6 +54,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -219,6 +220,11 @@ const t5::ArmOps* find_arm(const std::string& name) {
       &t5::arm_ops_google_fhir(),
 #endif
       &t5::arm_ops_hl7v2(),
+#if !defined(BENCH_NO_ARM_NDJSON)
+      // REC-6 control: same resources and same leaves as `json`, framed one
+      // record per line. Test 5 only -- it is not on the 4x4 timing grid.
+      &t5::arm_ops_ndjson(),
+#endif
   };
   for (const t5::ArmOps* arm : kArms)
     if (name == arm->name)
@@ -241,11 +247,34 @@ std::string usage() {
 // Modes
 // ---------------------------------------------------------------------------
 
+// Wall time of a read, in nanoseconds. TIMED AROUND THE READ ONLY -- file I/O
+// and fingerprint serialisation sit outside, because the question is what the
+// FORMAT costs to recover, not what this driver costs to run.
+//
+// Why this is measured at all (REC-7, 2026-09-08): recovery is not free, and
+// how unfree it is differs by orders of magnitude between formats. FastFHIR
+// repairs from its own redundancy -- a bounded diagnose-then-apply pass. The
+// json and hl7v2 arms have no redundancy to repair from, so their recovery is
+// a SEARCH: resynchronise, then try candidate structural edits until one
+// parses (bench/json_syntax_repair.hpp). A format that recovers 40% of its
+// data in 4 seconds and one that recovers 96% in 40 ms are not merely
+// different on the recovery axis, and a curve that plots only percentage hides
+// the second difference entirely.
+template <class Fn>
+std::int64_t timed_ns(Fn&& fn) {
+  const auto t0 = std::chrono::steady_clock::now();
+  fn();
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now() - t0).count();
+}
+
 int mode_hash(const t5::ArmOps& arm, const std::string& in,
               const std::string& out_path) {
   const auto wire = read_file(in);
-  const auto fp = arm.calc_hash(wire);
-  std::printf("units=%zu digest=%s\n", fp.units.size(), hex_digest(fp.digest).c_str());
+  t5::StreamFingerprint fp;
+  const std::int64_t ns = timed_ns([&] { fp = arm.calc_hash(wire); });
+  std::printf("units=%zu digest=%s read_ns=%lld\n", fp.units.size(),
+              hex_digest(fp.digest).c_str(), static_cast<long long>(ns));
   if (!out_path.empty())
     write_file(out_path, stamp_fingerprint(fp));
   return 0;
@@ -270,8 +299,10 @@ int mode_corrupt(const t5::ArmOps& arm, std::size_t bits, unsigned seed,
 int mode_recover(const t5::ArmOps& arm, const std::string& in,
                  const std::string& out_path) {
   const auto wire = read_file(in);
-  const auto fp = arm.recover(wire);
-  std::printf("units=%zu digest=%s\n", fp.units.size(), hex_digest(fp.digest).c_str());
+  t5::StreamFingerprint fp;
+  const std::int64_t ns = timed_ns([&] { fp = arm.recover(wire); });
+  std::printf("units=%zu digest=%s recover_ns=%lld\n", fp.units.size(),
+              hex_digest(fp.digest).c_str(), static_cast<long long>(ns));
   if (!out_path.empty())
     write_file(out_path, stamp_fingerprint(fp));
   return 0;

@@ -49,6 +49,21 @@ enum class Stage {
   Test2RandomAccessCompact,
   Test3Query,
   Test3QueryCompact,
+  // A SELECTIVE query, as opposed to Test3Query's census.
+  //
+  // Test3Query's QuerySummary has 17 output fields -- value kind, effective
+  // kind, issued presence and component value kinds for EVERY observation --
+  // so it cannot short-circuit: every field it reads feeds a required output.
+  // That measures full traversal, which is a real workload but is not what a
+  // clinical system usually asks. The common ask is "find the cholesterol
+  // results": is this an Observation, does it carry LOINC 2085-9, and if not,
+  // move to the next record without touching anything else.
+  //
+  // The distinction matters because it is exactly where a zero-copy lens
+  // architecture should win and a parse-first format cannot: FastFHIR can
+  // reject a non-match on a tag compare and a code compare, while JSON must
+  // materialise the document before it can ask the first question.
+  Test3Selective,
   Test4Enrich,
   Test4EnrichCompact,
 };
@@ -125,6 +140,10 @@ struct ArmRunResult {
   // compare it, and google_fhir was never compared at all because validate_parity
   // only ever looked at fastfhir/json/hl7.
   std::int64_t query_loinc_matches = 0;
+  // Cross-arm gate for Stage::Test3Selective: every arm must find the same
+  // cholesterol results. A selective query that is fast because it matched
+  // nothing is exactly the failure this catches.
+  std::int64_t selective_matches = -1;
   // DATA ELEMENTS (leaves) in this arm's Test 1 output -- patient.name,
   // patient.gender, each lab value. `entries` counts RESOURCES: 1 Patient plus
   // 316 Observations is 317, which is true and much smaller than the data. The
@@ -222,6 +241,8 @@ inline std::string to_string(Stage s) {
       return "test_3_query";
     case Stage::Test3QueryCompact:
       return "test_3_compact";
+    case Stage::Test3Selective:
+      return "test_3_selective";
     case Stage::Test4Enrich:
       return "test_4_enrich";
     case Stage::Test4EnrichCompact:

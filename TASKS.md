@@ -781,6 +781,434 @@ Ordered by what unblocks the most.
 
 ---
 
+## ▶ REC — competitor recovery parity (test 5)
+
+**Verified state, 2026-09-08 — read this before proposing work here.** An
+earlier draft of this block asserted that "the other three arms have no repair
+step at all". That is **false**, and the code disproves it
+(`bench/bench_test_5.hpp`):
+
+| arm | `recover_stream()` does | line |
+|---|---|---|
+| fastfhir | `FF_Recovery::recover()` then `apply()` — diagnoses **and rewrites bytes**, the only arm that repairs rather than resynchronises | 1456 |
+| json | whole-document parse; on failure **resync on `"resource"` markers**, brace-match each extent, keep the ones that parse | 1479 |
+| google_fhir | **TLV record resync**: scan for a `'P'`/`'O'` type byte with a plausible length prefix, emit, and rescan forward on an implausible one | 1524 |
+| hl7v2 | `return scan_v2_canonical(wire);` — **the same scan as the baseline. This is the only arm with no repair.** | 1572 |
+
+Two consequences that change what is worth building:
+
+1. **The gap is hl7v2, not "the competitors".** json and google_fhir already
+   have record-level resynchronisation. What none of the three do is repair
+   *bytes*; they resynchronise and discard. FastFHIR repairs. That is the real
+   axis the curve measures, and it is a fair one — but it must be stated in
+   those terms, not as "recovery vs none".
+2. **json's measured resilience already includes a repair pass.** Its 0.8
+   resources lost per flip is 0.8 *because* the `"resource"` resync bounds
+   damage to the entry it lands in. Without that pass one flip would cost the
+   document tail. Do not re-derive json's number as though it were raw parser
+   behaviour.
+
+⚠ The comment above `scan_v2_canonical` at line 1572 claims a destroyed `\r` is
+recoverable because "the merged line still contains the next segment's header".
+**It is not**: `hl7_split(text,'\r')` splits only on `\r`, so a flipped
+terminator leaves two segments on one line, `f[0]` names the first, and the
+second segment's header is buried mid-line and never read. Fix the comment when
+REC-2 lands.
+
+**What this block is for:** close the hl7v2 gap, add the byte-level repair
+none of the competitors have, then re-measure. The claim worth publishing is not
+"FastFHIR survives corruption and the others do not" — it is **how much
+FastFHIR's on-wire redundancy buys over the best a format without redundancy can
+do**, which is only meaningful once the opponent is real.
+
+### Grounding — what production actually does (researched 2026-09-08)
+
+| System | Strategy | Source |
+|---|---|---|
+| HAPI (reference Java v2 parser) | `LenientErrorHandler` is the **default**: log and continue, never abort. Unexpected segments become generic elements rather than failures (`ParserConfiguration.setUnexpectedSegmentBehaviour()`). | [ParserConfiguration](https://hapifhir.github.io/hapi-hl7v2/base/apidocs/ca/uhn/hl7v2/parser/ParserConfiguration.html) |
+| Mirth Connect | Channel **preprocessor** runs before the parser: split on `\r`, test each line against `/^[a-zA-Z0-9]{3}\|/`; a match starts a new segment, otherwise append to the previous one. This is **resynchronisation on the 3-char segment header**. | [Mirth line-break repair](https://nelsonwells.com/posts/2011/07/fixing-line-breaks-in-hl7-messages-in-mirth-connect/) |
+| `jsonrepair` (canonical JSON repairer) | Applicable rules: missing closing brackets, truncated documents (close all open structures), missing commas between elements, missing quotes, missing escapes. | [josdejong/jsonrepair](https://github.com/josdejong/jsonrepair) |
+
+Two honesty notes that must survive into the write-up:
+
+1. **Production engines mostly reject, they do not repair.** Malformed messages
+   go to an error queue; repair is bolted on by the integrator (Mirth
+   preprocessor scripts, HAPI lenient config), not shipped as a repair engine.
+   Building this makes the competitor arms **stronger than production default**,
+   which is the correct direction — it forecloses "you strawmanned the
+   alternatives".
+2. **Our damage is substitution, not omission.** A bit flip turns `}` into some
+   other byte; it does not delete it. The `jsonrepair` rules still apply because
+   the *symptoms* coincide (unbalanced depth, juxtaposed values, unterminated
+   string), but do not claim we are running jsonrepair's algorithm — we are
+   applying its heuristics to a different fault model.
+
+### The frame-shift correction (Ryan, 2026-09-08) — read before REC-1
+
+HL7v2 field identity is **ordinal**: OBX-5 *is* the fifth thing between pipes.
+A flipped `|` does not merge two fields and stop; `hl7_split` returns one fewer
+field and **every subsequent index in that segment shifts down**. An earlier
+note in this repo said the damage was local to the merged pair; that was wrong.
+
+The current scanner already exhibits this, and its outcome mix is the evidence:
+`scan_v2_canonical` (`bench/bench_test_5.hpp:973`) splits then indexes `f[4]`,
+`f[5]`, `f[6]` positionally, so a shift makes `sub_id` garbage,
+`resource_key("Observation", garbage)` match nothing in the baseline, and the
+row score **spurious** while the real observation scores **missing**. hl7v2 is
+the only arm with a material spurious count (9.7% of non-correct outcomes vs
+json's 0.0%) and that is the frame-shift signature.
+
+The shift is bounded by the segment terminator — `hl7_split(text,'\r')` runs
+first and real v2 restarts field numbering per segment — **unless the `\r`
+itself is flipped**, which the damage model does corrupt, merging two segments
+and losing both.
+
+### Measured baseline these tasks must beat
+
+Blast radius at k=1, against an identical 34,839-leaf baseline in all four arms
+(23.7 leaves per resource):
+
+| arm | leaves lost per flip | = resources |
+|---|---|---|
+| fastfhir | 0.0 | 0.00 |
+| hl7v2 | 3.0 | 0.13 |
+| json | 19.0 | 0.80 |
+| google_fhir | 19.0 | 0.80 |
+
+**One flip costs JSON 0.8 of a resource, not the document tail — neither format
+cascades.** The gap is *damage granularity*: a JSON Bundle entry frames a whole
+resource in one brace-delimited object, so structural damage inside it costs the
+whole resource; v2 spreads that resource across many CR-framed segments, so
+damage costs one segment. Do not describe this as a cascade or a truncation —
+an earlier revision did and the blast-radius numbers refute it.
+
+Density-matched medians (the raw-k table overstates v2's lead, because k=2048 is
+0.36% density for v2 and 0.59% for json):
+
+| density | fastfhir | hl7v2 | json | google_fhir |
+|---|---|---|---|---|
+| 0.10% | 99.6 | 80.2 | 70.4 | 79.2 |
+| 0.20% | 98.8 | 72.3 | 56.4 | 63.5 |
+| 0.30% | 97.8 | 68.0 | 46.1 | 50.7 |
+
+---
+
+- [x] **REC-1. hl7v2 segment arity check — the frame-shift detector.**
+      ✅ **DONE 2026-09-08** (`bench/bench_test_5.hpp`, `hl7_expected_arity()`
+      + the guard at the top of `scan_v2_canonical`'s segment loop).
+      - Arities measured on the clean wire, not assumed: **MSH 12, PID 14,
+        OBX 7, ZFX 3** across 14,773 segments, one fixed arity per type. A
+        segment whose `hl7_split(seg,'|')` count differs is dropped rather than
+        read at shifted indices.
+      - Catches shifts in both directions: a flipped `|` removes a boundary,
+        and `~` (0x7E) / `\` (0x5C) are each one bit from `|` (0x7C) so they can
+        create one. A flipped `\r` merges two segments into an over-long line,
+        also caught.
+      - Placed in the shared scanner, not `recover_stream()`: refusing to
+        misread is reader robustness, not repair. Clean-wire baseline verified
+        unchanged (units=34839).
+      - ⚠ **The prediction in this block was WRONG and the measurement says so.**
+        It was going to "gut" `wrong` (9,895) and `spurious` (79,858). Measured
+        over the same 80 replicates (k=64/256/1024/2048 × 20 seeds):
+
+        | | wrong | spurious | median pct |
+        |---|---|---|---|
+        | before | 8,056 | 62,438 | unchanged |
+        | after | 7,834 | 62,354 | unchanged |
+        | delta | **−2.8%** | **−0.1%** | 0 |
+
+      - **Why it barely fires, measured:** only **12.0%** of this arm's
+        structural positions are v2 delimiters (`| ^ & ~ \`). **70.7% are JSON
+        punctuation inside ZFX payloads**, 12.9% are segment names, 4.3% are
+        terminators. A flip in a ZFX payload breaks that payload's JSON but
+        leaves the segment at 3 fields, so arity cannot see it. Frame shift is
+        real and now handled; it is simply not where this corpus takes damage.
+      - The task was still worth doing — it is correct, it is cheap, and it
+        removes a silent-corruption path — but it does not move the curve, and
+        the write-up must not imply it did.
+
+- [x] **REC-1b. ZFX `observation.id` scope loss — same class as the OBX-4 bug.**
+      ✅ **DONE 2026-09-08** (`bench/bench_test_5.hpp`, ZFX branch of
+      `scan_v2_canonical`).
+      - `observation.id` opens a scope every following `observation.*` ZFX
+        attaches to. Two paths left `obs_key` holding the PREVIOUS
+        observation's key when that id was damaged: `continue` on a parse throw,
+        and falling through with a non-string payload. Both silently
+        misattributed every later field — values did not go missing, they MOVED,
+        the exact failure the OBX-4 keying change was made to eliminate.
+      - Fix: when an `observation.id` cannot be read, **clear `obs_key`**. The
+        existing `if (key.empty()) continue;` then drops the orphaned fields, so
+        a damaged id costs its own observation instead of corrupting the one
+        before it.
+      - Clean-wire baseline byte-identical (units=34839, digest cbb2756…).
+      - Measured over the same 80 replicates as REC-1:
+
+        | stage | wrong | spurious |
+        |---|---|---|
+        | before REC-1 | 8,056 | 62,438 |
+        | after REC-1 | 7,834 | 62,354 |
+        | after REC-1b | **7,200** | **58,490** |
+        | REC-1b delta | **−8.1%** | **−6.2%** |
+
+      - Bigger than REC-1, and on the right surface — but still not a
+        curve-mover: median `pct` is unchanged at every k. Combined, REC-1 and
+        REC-1b remove ~10.6% of `wrong` and ~6.3% of `spurious`. Report it that
+        way; neither task changes the headline.
+
+- [x] **REC-1c. Missed scope boundary from a damaged ZFX field NAME.**
+      ✅ **DONE 2026-09-08.** The largest of the three by a wide margin.
+      - REC-1b covers a damaged id *payload*. A damaged field NAME
+        (`observation.id` -> `observatioX.id`) falls through the trailing
+        `else { continue; }`, so the scope never opens and the next
+        observation's fields attach to the previous one.
+      - Signal verified before implementing: on the clean wire the encoder emits
+        each `sub` at most once per scope — **1,468 scopes, 0 repeated
+        (scope, sub) pairs** — so a repeat is unambiguous. Checked on the RAW
+        `sub`, before the `.details` / `[*]` / `[x]` trimming, which is the form
+        that measurement used.
+      - Also clears the observation scope at each `MSH`: a new message must not
+        inherit the previous message's scope.
+      - Clean-wire baseline byte-identical (units=34839, digest cbb2756…).
+
+        | stage | wrong | spurious |
+        |---|---|---|
+        | before REC-1 | 8,056 | 62,438 |
+        | after REC-1 | 7,834 | 62,354 |
+        | after REC-1b | 7,200 | 58,490 |
+        | **after REC-1c** | **645** | **18,756** |
+        | REC-1c delta | **−91.0%** | **−67.9%** |
+        | cumulative | **−92.0%** | **−70.0%** |
+
+      - Median `pct` rose as well (k=1024: 73.20 → 73.40; k=2048: 65.40 →
+        65.65), and `correct` with it — which dropping fields alone cannot do.
+      - **Why, verified in the scorer** (`bench_test_5.cpp:287`):
+        `Triple::operator<` and `==` order on (parent, offset, tag) and
+        **deliberately exclude content**. A misattributed field therefore has
+        the SAME identity as the real leaf, so in the merge join it can be
+        paired with the baseline unit first — scoring `wrong` — and evict the
+        real value out to `spurious`. Misattribution was not only inventing
+        data, it was displacing correct data. Removing it recovers both.
+      - This closes the misattribution class for hl7v2. The remaining 18,756
+        spurious is elsewhere, most likely the 70.7% ZFX-JSON payload surface,
+        which is REC-3's territory.
+
+- [x] **REC-0. Split the per-arm codecs out of `bench_test_5.hpp`.**
+      ✅ **DONE 2026-09-08.** The harness had grown ~1,400 lines of
+      format-specific decoding spread across three separate `#if/#elif` macro
+      chains, so each arm's reader, damage model and recovery sat in three
+      places and none of them next to each other.
+      - `bench_test_5.hpp` **1,700 → 376 lines**: it now owns only test 5 —
+        `UnitRef`/`StreamFingerprint`, the canonical leaf and census machinery,
+        `flip_positions`, and the arm dispatch.
+      - Four codec headers, each with its arm's reader, `structural_positions`
+        and `recover_stream` together and labelled in that order:
+
+        | header | lines |
+        |---|---|
+        | `bench/arm_google_fhir_codec.hpp` | 588 |
+        | `bench/arm_hl7v2_codec.hpp` | 483 |
+        | `bench/arm_fastfhir_codec.hpp` | 259 |
+        | `bench/arm_json_codec.hpp` | 201 |
+
+      - Included from inside `namespace bench::test_5 { inline namespace
+        BENCH_ARM_NS {` under the arm guard. Not self-contained by design —
+        each says so in its header comment and names what it borrows from the
+        harness. `flip_positions` needed a forward declaration in the harness
+        because the codecs' `corrupt_stream()` calls it before its definition.
+      - **Behaviour-neutral, verified rather than assumed:** all four clean-wire
+        digests byte-identical (`hl7v2 cbb2756…`, `json 3dfb8b1f…`,
+        `google_fhir f917ea61…`, `fastfhir 72286 63f…`, units 34839 each), the
+        80-replicate damaged-wire census unchanged (wrong=645, spurious=18756,
+        identical medians), and the four-arm harness still at element parity.
+      - `bench/BUILD.bazel` lists all four in `bench_core_common` hdrs.
+
+- [x] **REC-2. hl7v2 segment resync on the 3-char header.**
+      ✅ **DONE 2026-09-08.** `hl7_resync_segments()` in
+      `bench/arm_hl7v2_codec.hpp`, a pre-pass over the segment list. Both rules
+      are gated on the REC-1 arity, so neither can fire on a healthy segment;
+      the gate is sound because the encoder escapes `|` to `\F\`, so every
+      unescaped `|` on the wire is a real separator and the field count is
+      trustworthy even when the surrounding bytes are not.
+      - **R2a name repair** (7.6% of flips): a flipped 3-char name makes the
+        segment unrecognised and it is dropped whole, but the SHAPE still names
+        it — the four arities are distinct (12/14/7/3). ZFX additionally
+        requires field 1 to be a FHIR path, since arity 3 is the common case.
+      - **R2b terminator re-split** (2.5% of flips): a flipped `\r` merges two
+        segments and REC-1 then drops BOTH. The second segment's name is still
+        in the bytes, sitting at the tail of a field, so the line is cut back
+        apart there — and the byte that WAS the `\r` is consumed, restoring the
+        original field exactly. **This is the rule Mirth does not have**: its
+        preprocessor only ever JOINS a spuriously broken line, because its fault
+        model is an inserted line break, not a lost one.
+      - Clean-wire baseline byte-identical (units=34839, digest cbb2756…).
+
+      **Each rule verified in isolation with a targeted single flip**, scored on
+      leaf counts because `pct` at one decimal cannot resolve one segment:
+
+      | injected fault | correct, OFF | correct, ON |
+      |---|---|---|
+      | one `\r` flipped (two ZFX merged) | 34,819 | **34,839** |
+      | one ZFX name flipped to `ZFY` | 34,820 | **34,839** |
+
+      Both recover the baseline **exactly** — 20 and 19 leaves respectively, a
+      measure of how much one ZFX segment carries.
+
+      Aggregate over the same 80 replicates, on top of REC-3:
+
+      | k | REC-3 only | + REC-2 | delta |
+      |---|---|---|---|
+      | 64 | 99.40 | **99.60** | +0.20 |
+      | 256 | 94.65 | **95.00** | +0.35 |
+      | 1024 | 78.40 | **79.85** | +1.45 |
+      | 2048 | 70.00 | **72.35** | +2.35 |
+
+      `wrong` and `spurious` are flat (74 and ~620 at k=2048, unchanged), so the
+      gain is recovery rather than invention. The delta grows with k because
+      name and terminator flips accumulate; at 10.1% of the damage surface it
+      was never going to be large, which is what the surface breakdown predicted.
+
+- [x] **REC-3. Byte-level structural repair — the one thing no competitor did.**
+      ✅ **DONE 2026-09-08.** `bench/json_syntax_repair.hpp`, shared by the json
+      and hl7v2 codecs because both need it: 82.4% of the flips the v2 model
+      applies land on JSON punctuation inside ZFX payloads.
+      - Rule set is `jsonrepair`'s, restricted to the rules that bear on a
+        SUBSTITUTION fault model: close unclosed structures, then bounded
+        single-character substitution, then insertion as a fallback. Its
+        LLM/JS-paste rules (Python constants, MongoDB types, comments, JSONP)
+        are deliberately not implemented.
+      - Search is bounded by the parser's own reported error byte (64 back, 4
+        forward), not a full-fragment sweep. A candidate is accepted only when
+        it PARSES — never on looks.
+      - **Structure only, never content.** Nothing invents a key, value or
+        digit. json's `spurious` stayed at **0** across every k, which is the
+        evidence that it is not manufacturing units.
+      - Enabled from `recover_stream()` only. The baselines are byte-identical
+        (`hl7v2 cbb2756…`, `json 3dfb8b1f…`), so ON and OFF finally measure
+        different things for these arms — acceptance criterion 4.
+
+      **hl7v2**, median pct, same 80 replicates:
+
+      | k | before REC-3 | after | OFF |
+      |---|---|---|---|
+      | 64 | 96.60 | **99.40** | 96.60 |
+      | 256 | 87.60 | **94.65** | 87.60 |
+      | 1024 | 73.40 | **78.40** | 73.40 |
+      | 2048 | 65.65 | **70.00** | 65.65 |
+
+      **json**, median pct, against the pre-REC full run:
+
+      | k | before (full run) | after | OFF |
+      |---|---|---|---|
+      | 64 | 91.3 | **93.80** | 0.00 |
+      | 256 | 75.2 | **80.10** | 0.00 |
+      | 1024 | 46.4 | **54.85** | 0.00 |
+      | 2048 | 27.4 | **37.75** | 0.00 |
+
+      - ⚠ **json's recovery-OFF score is 0.00 at every k.** `calc_stream_hash`
+        parses the whole Bundle, so a single flip anywhere destroys the entire
+        document's readability. Everything json scores comes from the resync +
+        repair pass. State it that way: JSON's raw resilience to a structural
+        flip is nil, and its curve is a measure of its RECOVERY, exactly as
+        FastFHIR's is.
+      - hl7v2's `wrong` and `spurious` rose in absolute terms (medians at
+        k=2048: 19→74 and 522→614) while `correct` rose far more. That is the
+        honest trade — repair that recovers more data also occasionally
+        reparents some — and the four-outcome census is what makes it visible
+        rather than hidden inside a single percentage.
+      - **Whole-document repair was tried and removed.** It is redundant with
+        the per-resource path (the damaged entry is repaired there either way)
+        and cost 4.6s per replicate re-parsing a 1.6 MB Bundle per candidate.
+        Removing it left every median identical (93.80 / 80.10 / 54.85 / 37.75)
+        at 284s instead of 368s. Verified, not assumed.
+
+- [x] **REC-4. json record resync on anchors.** ✅ **ALREADY BUILT** —
+      `bench/bench_test_5.hpp:1479` resyncs on `"resource"` markers with
+      brace-matched extents. Proposed as new work on 2026-09-08 before the code
+      was read; it was already there. Left here so it is not proposed a third
+      time. Possible refinement, not required: anchor on `"fullUrl"` as well, so
+      an entry whose `"resource"` key is itself damaged is still findable.
+
+- [x] **REC-5. google_fhir TLV resync.** ✅ **ALREADY BUILT** —
+      `bench/bench_test_5.hpp:1524` scans for a `'P'`/`'O'` type byte with a
+      plausible length prefix and rescans forward when the length is
+      implausible. Same note as REC-4: proposed before the code was read.
+
+- [x] **REC-6. NDJSON control arm.** ✅ **DONE 2026-09-08.**
+      `bench/arm_ndjson_codec.hpp` + `bench/arm_ndjson.cpp`. A CONTROL, not a
+      competitor, and test-5 only — it answers a framing question about
+      corruption, not a performance one, so it is not on the 4x4 timing grid.
+      - Artifact generated **from** `json.bin` in the run script's artifact
+        stage. Both fingerprint to the **identical digest `3dfb8b1f…`, 34,839
+        units**, which is the proof that framing is the only variable.
+      - Shares the leaf walk (`bench/json_leaf_walk.hpp`, extracted for this) so
+        the two readers cannot drift into looking like a resilience difference.
+      - Same damage rule, **including the `\n` record separators** — v2's `\r`
+        is a corruption target, so NDJSON's terminator must be one too, or the
+        control would be handed damage-free framing the others do not get.
+
+      | k | json ON | ndjson ON | json OFF | ndjson OFF |
+      |---|---|---|---|---|
+      | 1 | 99.9 | 100.0 | **0.0** | **99.9** |
+      | 256 | 80.1 | 91.1 | 0.0 | 75.0 |
+      | 2048 | 37.8 | **55.2** | 0.0 | **27.0** |
+
+      - **The granularity hypothesis holds.** Reframing alone is worth +17.4
+        points at k=2048 with recovery, and without recovery it is the entire
+        difference between 0.0% and 99.9% at k=1. NDJSON with no repair at all
+        beats JSON with full repair up to k=128.
+      - **Consequence for the write-up: the supportable claim is "single-document
+        nesting is fragile", NOT "JSON is fragile".** Anything published that
+        says the latter is now contradicted by this repo's own control.
+
+- [x] **REC-7. Recovery COST.** ✅ **DONE 2026-09-08.** `--recover` and `--hash`
+      report `recover_ns` / `read_ns`, timed around the READ only (file I/O and
+      fingerprint serialisation outside the window); the sweep carries them as
+      CSV columns and `fig9_recovery_cost` plots ms per percentage point
+      recovered.
+      - One axis, not two: wall time alone rewards an arm that fails fast, and
+        percentage alone hides what the percentage cost.
+
+      | k | fastfhir | hl7v2 | ndjson | json |
+      |---|---|---|---|---|
+      | 1 | 63 ms | 35 ms | 36 ms | 46 ms |
+      | 2048 | **84 ms** | 645 ms | 2,509 ms | **5,638 ms** |
+
+      - **FastFHIR is flat across a 2000× damage range** because it checks
+        witnesses already on the wire — work proportional to the STREAM. The
+        others must SEARCH for a repair that parses, so their cost tracks the
+        DAMAGE (json 123×, ndjson 70×, hl7v2 19×).
+      - **protobuf is excluded from fig9, and this is not an oversight.**
+        Researched 2026-09-08: protobuf has no recovery mechanism and no
+        recovery tooling. Its parser validates WIRE FORMAT only, so corruption
+        leaving a message well-formed is undetectable by construction, and the
+        ecosystem tools (protobuf-inspector, protoscope, blackboxprotobuf,
+        protod) reverse-engineer unknown schemas rather than repair bytes. The
+        TLV resync in `arm_google_fhir_codec.hpp` is a heuristic THIS REPO
+        wrote so the arm would not be measured against nothing. Its recovery
+        percentage stays in fig8; costing it would imply protobuf users pay that
+        price for that benefit, and they do neither. Its timings also FALL with
+        damage (32 → 9 ms) because it gives up earlier, which on a cost axis
+        reads as efficiency.
+      - ⚠ Process note: the `recover_ns` edits to `scripts/recovery_sweep.py`
+        were lost once between runs and the sweep silently emitted the old
+        header. Caught by checking the CSV columns before trusting the data.
+        **Check the header, not just that the sweep exited 0.**
+
+### Acceptance — this block is done when
+
+1. hl7v2 has a `recover_stream()` that does something its baseline scan does not
+   (REC-1 + REC-2). The other arms already clear this bar.
+2. The `--check` process still verifies recovered units are a content-verified
+   subset of the clean baseline. **Repair must never manufacture a passing
+   unit** — a repair that invents plausible content scores `spurious`, and the
+   four-outcome census is what proves it did not.
+3. Cross-arm census parity still holds at 34,839.
+4. Both curves are published: recovery ON and OFF per arm, so the *delta* is
+   visible. FastFHIR's headline becomes that delta, not the absolute.
+5. The write-up distinguishes **resynchronise-and-discard** (json, google_fhir,
+   and hl7v2 after REC-2) from **repair** (FastFHIR, and any arm after REC-3).
+   Those are different capabilities and the curve should not blur them.
+
 ## ▶ UP — filed upstream
 
 **Status** FILED 2026-08-26 into `../FastFHIR/TASKS.md`. **Not committed** —
