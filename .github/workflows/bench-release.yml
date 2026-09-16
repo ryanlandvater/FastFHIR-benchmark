@@ -35,6 +35,10 @@ on:
         description: Self-hosted runner label
         required: true
         default: bench-local
+      targets_mb:
+        description: Bundle-size ladder in MB (ignored when quick)
+        required: true
+        default: 1,2,4,8,16,32,64,256
       quick:
         description: Reduced ladder, no recovery sweep (never publishable)
         type: boolean
@@ -56,6 +60,7 @@ permissions:
 env:
   FASTFHIR_REF: ${{ inputs.fastfhir_ref || github.event.client_payload.ref }}
   BASELINE_REF: ${{ inputs.baseline_ref || github.event.client_payload.baseline || 'auto' }}
+  TARGETS_MB: ${{ inputs.targets_mb || github.event.client_payload.targets_mb || '1,2,4,8,16,32,64,256' }}
   QUICK: ${{ github.event_name == 'workflow_dispatch' && inputs.quick || false }}
   RESULTS: results/ci
 
@@ -74,7 +79,7 @@ jobs:
       fastfhir_sha: ${{ steps.gate.outputs.fastfhir_sha }}
       platform: ${{ steps.gate.outputs.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Prepare corpus and Python
         run: |
@@ -98,7 +103,7 @@ jobs:
           rc=0
           .venv/bin/python scripts/bench_ab.py \
             --candidate "$FASTFHIR_REF" --baseline "$BASELINE_REF" \
-            --out "$RESULTS" "${quick[@]}" || rc=$?
+            --targets-mb "$TARGETS_MB" --out "$RESULTS" "${quick[@]}" || rc=$?
           # 2 = cross-arm parity mismatch: the run is complete but the gate
           # will refuse it. Anything else is a failure of the run itself.
           if [[ "$rc" -eq 2 ]]; then
@@ -130,7 +135,7 @@ jobs:
             || echo "::warning::publish gate refused this run -- see the job summary"
           cat "$RESULTS/release-notes.md" >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: bench-results
@@ -153,7 +158,7 @@ jobs:
       FASTFHIR_SHA: ${{ needs.bench.outputs.fastfhir_sha }}
       PLATFORM: ${{ needs.bench.outputs.platform }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: bench-results
           path: bench-results

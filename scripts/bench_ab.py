@@ -178,7 +178,9 @@ def main() -> int:
     ap.add_argument("--profile", help="FASTFHIR_PRODUCTION_PROFILE for BOTH sides "
                     "(default: each commit's own base preset)")
     ap.add_argument("--out", required=True, type=Path)
-    ap.add_argument("--targets-mb", default="1,2,4,8,16,32,64")
+    # The harness's own default ladder (bench/main.cpp): 256 MB is where
+    # layout differences dominate, so it belongs in every published run.
+    ap.add_argument("--targets-mb", default="1,2,4,8,16,32,64,256")
     ap.add_argument("--replicates", type=int, default=20)
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--warmup-iterations", type=int, default=1)
