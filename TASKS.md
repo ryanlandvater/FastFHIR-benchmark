@@ -636,6 +636,16 @@ cross-arm parity mismatch, not a crash.
               buffer the arm owns, or report the copy separately.
         - [ ] **PA-10c.** Test 4 (FF arm): switch to the APPEND-1 sequence once
               upstream ships it.
+              - Framing (Ryan, 2026-09-16): **growth per append is minimal, not
+                zero.** Each append adds one 84 B entry plus the resource,
+                unavoidably, because an entry is being added. That is far less
+                than a format that must rewrite the whole stream.
+              - Report it as "grows by the minimum", never as a defect.
+              - What APPEND-1 removes is only today's **excess**: the orphaned
+                N × 84 B copy of the previous array.
+        - Both array-building paths are now advertised upstream as first-class
+          (FastFHIR README Example 6a/6b, both executed by its README gate).
+          This arm defaults to 6a (tail); `BENCH_FF_BUNDLE=backfill` runs 6b.
 - [ ] **PA-8. Cross-arm validation must cover every arm.**
       [`bench/main.cpp:95`](bench/main.cpp:95) compares FastFHIR↔JSON and
       JSON↔HL7v2 only. Nothing has ever checked the Google arm, which is how a

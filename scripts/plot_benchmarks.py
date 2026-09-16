@@ -121,8 +121,9 @@ CAVEAT_ENRICH_MODEL = (
     "54 B header and its old 44 B checksum block (verified byte for byte under BENCH_VALIDATE)."
 )
 CAVEAT_ENRICH_ARRAY = (
-    "PA-10: FastFHIR's appended bytes still include a whole new (N+1) x 84 B Bundle.entry array, "
-    "so they grow with the bundle; upstream APPEND-1 rewrites the tail array instead (PA-10c)."
+    "PA-10: an append must grow FastFHIR by the new resource plus one 84 B entry -- the minimum. "
+    "Today it also appends a fresh copy of the other N entries (N x 84 B); upstream APPEND-1 "
+    "rewrites the tail array in place instead, removing that excess (PA-10c)."
 )
 
 
