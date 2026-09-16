@@ -263,19 +263,19 @@ inline constexpr std::string_view kLoincSystem = "http://loinc.org";
 // FastFHIR stream helpers (ported to the FF_* facade 2026-08-25)
 // ---------------------------------------------------------------------------
 // Builder::set_root() and Builder::finalize() became private in FastFHIR
-// a9fd4e9. The only way in is the friend free functions FF_StreamSetRoot /
-// FF_StreamFinalize, which take an FF_Stream -- and FF_Stream is exactly
+// a9fd4e9. The only way in is the friend free functions FF_BuilderSetRoot /
+// FF_BuilderFinalize, which take an FF_Builder -- and FF_Builder is exactly
 // std::shared_ptr<Builder>. So we build the shared_ptr ourselves rather than
-// going through FF_CreateStream: that keeps the existing "the fixture owns the
+// going through FF_CreateBuilder: that keeps the existing "the fixture owns the
 // arena, the builder borrows it" model, which BundlePatient::memory and
 // clone_bundle_patient() both depend on.
 
-inline FastFHIR::FF_Stream make_stream(const FastFHIR::Memory& memory,
-                                       FHIR_VERSION version = FHIR_VERSION_R5) {
+inline FastFHIR::FF_Builder make_builder(const FastFHIR::Memory& memory,
+                                        FHIR_VERSION version = FHIR_VERSION_R5) {
   return std::make_shared<FastFHIR::Builder>(memory, version);
 }
 
-// Benchmark-mode checksum. FF_StreamFinalize requires a hasher whenever the
+// Benchmark-mode checksum. FF_BuilderFinalize requires a hasher whenever the
 // algorithm is not NONE; hashing for real would measure OpenSSL rather than
 // FastFHIR, so this returns a zeroed digest of the right width. The stream
 // still carries a SHA256 header, exactly as it did before the port.
@@ -287,23 +287,23 @@ inline std::vector<BYTE> bench_null_sha256(const unsigned char*, Size) {
 // failure -- the facade is noexcept and returns status codes, so an unchecked
 // call would silently produce an unsealed stream and a fast, meaningless
 // number.
-inline FastFHIR::Memory::View seal_stream(const FastFHIR::FF_Stream& stream,
+inline FastFHIR::Memory::View seal_stream(const FastFHIR::FF_Builder& builder,
                                           const FastFHIR::Reflective::ObjectHandle& root,
                                           std::string_view context,
                                           FF_Checksum_Algorithm algorithm = FF_CHECKSUM_SHA256) {
-  FF_Result result = FastFHIR::FF_StreamSetRoot(FastFHIR::FF_StreamSetRootInfo{
-      .stream = stream,
+  FF_Result result = FastFHIR::FF_BuilderSetRoot(FastFHIR::FF_BuilderSetRootInfo{
+      .builder = builder,
       .root = root,
   });
   if (!result) {
-    throw std::runtime_error("FF_StreamSetRoot failed for " + std::string(context) + ": " +
+    throw std::runtime_error("FF_BuilderSetRoot failed for " + std::string(context) + ": " +
                              result.message);
   }
 
   FastFHIR::Memory::View view;
-  result = FastFHIR::FF_StreamFinalize(
-      FastFHIR::FF_StreamFinalizeInfo{
-          .stream = stream,
+  result = FastFHIR::FF_BuilderFinalize(
+      FastFHIR::FF_BuilderFinalizeInfo{
+          .builder = builder,
           .algorithm = algorithm,
           // A hasher is required only when the algorithm is not NONE.
           .hasher = algorithm == FF_CHECKSUM_NONE ? FastFHIR::FF_HashCallback{}
@@ -311,7 +311,7 @@ inline FastFHIR::Memory::View seal_stream(const FastFHIR::FF_Stream& stream,
       },
       view);
   if (!result) {
-    throw std::runtime_error("FF_StreamFinalize failed for " + std::string(context) + ": " +
+    throw std::runtime_error("FF_BuilderFinalize failed for " + std::string(context) + ": " +
                              result.message);
   }
   return view;

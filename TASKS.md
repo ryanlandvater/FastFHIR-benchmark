@@ -301,7 +301,7 @@ cross-arm parity mismatch, not a crash.
 
 | ID | What it was | Resolution |
 |---|---|---|
-| PORT-1 | `Builder::set_root` / `finalize` private | `make_stream()` + `seal_stream()` in `harness.hpp` wrap `FF_StreamSetRoot` / `FF_StreamFinalize`. |
+| PORT-1 | `Builder::set_root` / `finalize` private | `make_builder()` + `seal_stream()` in `harness.hpp` wrap `FF_BuilderSetRoot` / `FF_BuilderFinalize`. |
 | PORT-2 | `Ingest::SourceType` gone | `FF_SOURCE_FHIR_JSON`; `extension_filter` pinned to `FILTER_ALL_KNOWN`; `payload_capacity` passed so simdjson parses in place. |
 | PORT-3 | Code enums unprefixed | `FF_`-prefixed throughout; `FF_UNSET` still falls through to each arm's `default:` — see PA-4. |
 | PORT-4 | `*ToString` removed | `serialize_<Enum>()`. |

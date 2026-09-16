@@ -193,8 +193,8 @@ namespace bench
       total_observation_count += p.observations.size();
     }
     FastFHIR::Memory payload_memory = FastFHIR::Memory::create(arena_hint);
-    const FastFHIR::FF_Stream stream = make_stream(payload_memory, FHIR_VERSION_R5);
-    FastFHIR::Builder &builder = *stream;
+    const FastFHIR::FF_Builder builder_handle = make_builder(payload_memory, FHIR_VERSION_R5);
+    FastFHIR::Builder &builder = *builder_handle;
 
     // BENCH_FF_PREFAULT: touch one byte per page of the arena BEFORE the clock
     // starts. Memory::create only reserves; every page is first-touched during
@@ -344,7 +344,7 @@ namespace bench
     // it a second time here would write a whole duplicate Bundle whose entry
     // slots are the unpatched originals.
     const std::int64_t test1_entries = static_cast<std::int64_t>(bundle.entry.size());
-    (void)seal_stream(stream, root_handle, "fastfhir arm bundle");
+    (void)seal_stream(builder_handle, root_handle, "fastfhir arm bundle");
     const std::int64_t test1_ns = test1_timer.stop_ns();
     const std::int64_t test1_cpu_ns = test1_timer.cpu_ns();
     if (trace)

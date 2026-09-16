@@ -3,8 +3,8 @@
 > ✅ **Ported 2026-08-25 — builds and runs.** The ingest path now uses
 > `FF_SOURCE_FHIR_JSON`, pins `extension_filter` to `FILTER_ALL_KNOWN`, and
 > passes `payload_capacity` so simdjson parses the document in place instead of
-> making a padded copy. Sealing goes through `make_stream()` / `seal_stream()`
-> in `harness.hpp` (`FF_StreamSetRoot` + `FF_StreamFinalize`).
+> making a padded copy. Sealing goes through `make_builder()` / `seal_stream()`
+> in `harness.hpp` (`FF_BuilderSetRoot` + `FF_BuilderFinalize`).
 >
 > Hydration also **sanitises cross-arena `choice[x]` values** here — see
 > [notes.md](../notes.md) §4. Without it the FastFHIR arm wrote a foreign arena

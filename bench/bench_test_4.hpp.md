@@ -2,8 +2,8 @@
 
 > ✅ **Ported 2026-08-25.** The
 > `append_obj()` → `set_root()` → `finalize()` sequence is now
-> `append_obj()` → `seal_stream()` (which wraps `FF_StreamSetRoot` /
-> `FF_StreamFinalize`). Also wrapped in a per-arm inline namespace — see
+> `append_obj()` → `seal_stream()` (which wraps `FF_BuilderSetRoot` /
+> `FF_BuilderFinalize`). Also wrapped in a per-arm inline namespace — see
 > [notes.md](../notes.md) §1.
 
 ## Purpose

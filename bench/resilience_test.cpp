@@ -136,7 +136,7 @@ void test_truncation(const FastFHIR::Memory &mem)
 // digest.
 void reseal_with_checksum(FastFHIR::Memory &mem)
 {
-  FastFHIR::FF_Stream stream = bench::make_stream(mem);
+  FastFHIR::FF_Builder builder_handle = bench::make_builder(mem);
   FastFHIR::Memory::View view;
   auto real_hasher = [](const unsigned char *b, Size n) -> std::vector<BYTE>
   {
@@ -146,8 +146,8 @@ void reseal_with_checksum(FastFHIR::Memory &mem)
     bench::provenance::sha256::finish(c, out.data());
     return out;
   };
-  const FF_Result r = FastFHIR::FF_StreamFinalize(
-      FastFHIR::FF_StreamFinalizeInfo{.stream = stream, .algorithm = FF_CHECKSUM_SHA256,
+  const FF_Result r = FastFHIR::FF_BuilderFinalize(
+      FastFHIR::FF_BuilderFinalizeInfo{.builder = builder_handle, .algorithm = FF_CHECKSUM_SHA256,
                                       .hasher = FastFHIR::FF_HashCallback{real_hasher}},
       view);
   if (!r)
@@ -394,8 +394,8 @@ void test_concurrent_build()
   constexpr int kTotal = kThreads * kPerThread;
 
   FastFHIR::Memory mem = FastFHIR::Memory::create(8 * 1024 * 1024);
-  FastFHIR::FF_Stream stream = bench::make_stream(mem);
-  FastFHIR::Builder &builder = *stream;
+  FastFHIR::FF_Builder builder_handle = bench::make_builder(mem);
+  FastFHIR::Builder &builder = *builder_handle;
 
   std::vector<std::vector<FastFHIR::Reflective::ObjectHandle>> per_thread(kThreads);
   std::atomic<int> failures{0};
@@ -437,7 +437,7 @@ void test_concurrent_build()
     for (auto &h : handles)
       bundle.entry.push_back(BundleentryData{.resource = static_cast<ResourceReference>(h)});
   const auto root = builder.append_obj(bundle);
-  (void)bench::seal_stream(stream, root, "resilience concurrent bundle");
+  (void)bench::seal_stream(builder_handle, root, "resilience concurrent bundle");
 
   FastFHIR::Parser p(mem);
   const FF_Result vr = p.validate_FFHR_stream();

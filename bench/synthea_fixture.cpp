@@ -31,15 +31,15 @@ BundlePatient make_bundle_patient_from_json_text(std::string_view json,
   const auto arena_size = std::max<std::size_t>(4096, file_size * static_cast<std::size_t>(2));
   item.memory = FastFHIR::Memory::create(arena_size);
 
-  const FastFHIR::FF_Stream stream = make_stream(item.memory);
+  const FastFHIR::FF_Builder builder_handle = make_builder(item.memory);
   FastFHIR::Ingest::Ingestor ingestor;
-  FastFHIR::Reflective::ObjectHandle root(stream.get(), FF_NULL_OFFSET);
+  FastFHIR::Reflective::ObjectHandle root(builder_handle.get(), FF_NULL_OFFSET);
   size_t parsed_count = 0;
 
   FF_Result result{FF_FAILURE};
   try {
     FastFHIR::Ingest::IngestRequest request{
-        .builder = *stream,
+        .builder = *builder_handle,
         .source_type = FF_SOURCE_FHIR_JSON,
         // FILTER_NONE, not the FILTER_ALL_KNOWN default: that mode SUPPRESSES
         // profile-native and HL7-known-safe extension URLs -- a real size win
@@ -75,7 +75,7 @@ BundlePatient make_bundle_patient_from_json_text(std::string_view json,
     throw std::runtime_error("No Patient resource in ingested root for " + json_path.string());
   }
 
-  (void)seal_stream(stream, root, json_path.string());
+  (void)seal_stream(builder_handle, root, json_path.string());
 
   // Rebuild every interned URL (see BundlePatient::url_table). MUST run AFTER
   // seal_stream: Parser validates the FF_HEADER on construction, and the
@@ -131,15 +131,15 @@ EnrichmentObservationFixture load_enrichment_observation_from_json(const std::fi
     EnrichmentObservationFixture fixture{};
     fixture.memory = FastFHIR::Memory::create(
       std::max<std::size_t>(4096, file_size * static_cast<std::size_t>(2)));
-  const FastFHIR::FF_Stream stream = make_stream(fixture.memory);
+  const FastFHIR::FF_Builder builder_handle = make_builder(fixture.memory);
   FastFHIR::Ingest::Ingestor ingestor;
-  FastFHIR::Reflective::ObjectHandle root(stream.get(), FF_NULL_OFFSET);
+  FastFHIR::Reflective::ObjectHandle root(builder_handle.get(), FF_NULL_OFFSET);
   size_t parsed_count = 0;
 
   FF_Result result{FF_FAILURE};
   try {
     FastFHIR::Ingest::IngestRequest request{
-        .builder = *stream,
+        .builder = *builder_handle,
         .source_type = FF_SOURCE_FHIR_JSON,
         .extension_filter = FF_ExtensionFilterMode::FILTER_ALL_KNOWN,
         .json_string = ingest_payload,
@@ -166,7 +166,7 @@ EnrichmentObservationFixture load_enrichment_observation_from_json(const std::fi
   // enrich_fastfhir re-reads it via Parser (the in-memory lab observation)
   // for the live-stream append. Without the seal the arena has no FFHR header
   // and Parser throws "FF_HEADER magic bytes mismatch".
-  (void)seal_stream(stream, root, "enrichment observation fixture");
+  (void)seal_stream(builder_handle, root, "enrichment observation fixture");
 
   fixture.observation = root_node.as<ObservationData>();
   return fixture;

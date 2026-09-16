@@ -115,8 +115,8 @@ inline EnrichResult<StreamType> enrich_fastfhir(const StreamType& payload,
   // Tracked as PA-9.)
   const std::size_t source_bytes_before = payload.view().size();
   StreamType enriched_stream = payload;
-  const FastFHIR::FF_Stream stream = make_stream(enriched_stream, FHIR_VERSION_R5);
-  FastFHIR::Builder& builder = *stream;
+  const FastFHIR::FF_Builder builder_handle = make_builder(enriched_stream, FHIR_VERSION_R5);
+  FastFHIR::Builder& builder = *builder_handle;
 
   Timer timer;
   timer.start();
@@ -142,7 +142,7 @@ inline EnrichResult<StreamType> enrich_fastfhir(const StreamType& payload,
   bundle.entry.push_back(BundleentryData{.resource = static_cast<ResourceReference>(observation_handle)});
 
   auto new_root = builder.append_obj(bundle);
-  (void)seal_stream(stream, new_root, "fastfhir arm enrich");
+  (void)seal_stream(builder_handle, new_root, "fastfhir arm enrich");
 
   EnrichMetricsSummary summary;
   summary.source_bytes = source_bytes_before;

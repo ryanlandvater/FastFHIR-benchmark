@@ -35,7 +35,7 @@ carries those qualifiers forward verbatim. Do not let a headline round them off.
 > (TASKS.md § PORT). ⚠️ The API references below were written against the
 > pre-`a9fd4e9` surface and have **not** been re-verified since; run a pass
 > against the current headers before implementing. Known moves: `Builder::set_root`
-> / `finalize` are private (use `make_stream()` / `seal_stream()` in
+> / `finalize` are private (use `make_builder()` / `seal_stream()` in
 > `bench/harness.hpp`), and `SourceType::FHIR_JSON` is now `FF_SOURCE_FHIR_JSON`.
 
 > **Test 4's second blocker is cleared (2026-09-05).** The parallel path in
@@ -61,8 +61,8 @@ does not exist in a fresh clone until that script runs.
 
 Ingestion path, in current API terms:
 `make_bundle_patient_from_json()` → `FF_CreateIngestor` / `FF_Ingest`
-→ `BundlePatient` struct → `FF_StreamAppendObject()` → `FF_StreamSetRoot()`
-→ `FF_StreamFinalize()` → sealed `Memory::View`; same pipeline as the
+→ `BundlePatient` struct → `FF_BuilderAppendObject()` → `FF_BuilderSetRoot()`
+→ `FF_BuilderFinalize()` → sealed `Memory::View`; same pipeline as the
 benchmark harness.
 
 **A resilience-specific note on the upstream change:** out-of-profile resources
