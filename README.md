@@ -110,6 +110,12 @@ regenerated at the commit's own shipped profile, via Bazel's
 `--override_module`. `provenance.json` then records that tree
 (`fastfhir_path_source: "bazel external repo"`) rather than the symlink.
 
+Published results come from `.github/workflows/bench-release.yml`. It runs
+[`scripts/bench_ab.py`](scripts/bench_ab.py), which alternates the release and
+its predecessor on one machine, then applies the
+[`scripts/publish_check.py`](scripts/publish_check.py) gate and attaches the
+results to a `bench-fastfhir-<version>` GitHub Release (TASKS.md PB-2).
+
 After any profile change, `rm -rf ../FastFHIR/generated_src` before
 regenerating — the generator never deletes output it no longer emits, so a
 stale tree survives the change and produces confusing compile errors.

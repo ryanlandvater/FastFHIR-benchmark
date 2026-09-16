@@ -140,6 +140,16 @@ int main(int argc, char **argv)
   int num_runs = 3;
   int warmup_iterations = 1;
   int num_replicates = 20;
+  // PB-2b: run replicates [replicate_first, replicate_first + num_replicates).
+  // A replicate's bundle depends only on (seed, size, index), so a process
+  // started at index r measures exactly the bundle a full sweep measures at r.
+  // That is what lets scripts/bench_ab.py interleave two builds replicate by
+  // replicate, each in its own process.
+  int replicate_first = 0;
+  // PB-2b: the FastFHIR tree this binary was compiled from, when the caller
+  // knows it better than Bazel's convenience link does (which names only the
+  // LAST build -- wrong for the other binary in an A/B pair).
+  std::string fastfhir_root_override;
   int64_t bundle_max_mb = 0;
   bool bundle_max_mb_explicit = false;
   int64_t fastfhir_vma_mb = 0;
@@ -192,6 +202,14 @@ int main(int argc, char **argv)
     else if (args[i] == "--replicates" && i + 1 < args.size())
     {
       num_replicates = std::max(1, std::atoi(args[i + 1].data()));
+    }
+    else if (args[i] == "--replicate-first" && i + 1 < args.size())
+    {
+      replicate_first = std::max(0, std::atoi(args[i + 1].data()));
+    }
+    else if (args[i] == "--fastfhir-root" && i + 1 < args.size())
+    {
+      fastfhir_root_override = std::string(args[i + 1]);
     }
     else if (args[i] == "--bundle-max-mb" && i + 1 < args.size())
     {
@@ -451,6 +469,7 @@ int main(int argc, char **argv)
   // not -- because the profile and compilation mode are invisible otherwise.
   bench::provenance::Options prov_opts;
   prov_opts.profile_override = profile_override;
+  prov_opts.fastfhir_root_override = fastfhir_root_override;
   prov_opts.corpus_dir = synthea_dir;
   prov_opts.seed = rng_seed;
   const bench::provenance::Provenance prov = bench::provenance::collect(prov_opts);
@@ -647,7 +666,7 @@ int main(int argc, char **argv)
               << " replicates x " << num_runs << " runs, " << warmup_iterations
               << " warmups) ===\n";
 
-    for (int replicate = 0; replicate < num_replicates; ++replicate)
+    for (int replicate = replicate_first; replicate < replicate_first + num_replicates; ++replicate)
     {
       // ONE bundle per replicate, drawn from a seed derived from
       // (base seed, target size, replicate index) rather than from a single

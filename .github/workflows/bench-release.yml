@@ -1,0 +1,192 @@
+# Benchmark one FastFHIR revision against a baseline on a self-hosted runner,
+# and publish the result as a GitHub Release (TASKS.md PB-2).
+#
+#   bench    (self-hosted)  pin both refs -> interleaved A/B timing -> artifacts,
+#                           recovery sweep, figures for the candidate -> gate
+#   publish  (ubuntu)       only when the gate passed AND publishing was asked
+#                           for: create/update release bench-fastfhir-<describe>
+#
+# Runner requirements (set in the runner's .env file, next to run.sh):
+#   BENCH_CORPUS_DIR          the Synthea FHIR directory datasets/synthea links to
+#   FHIR_PACKAGES_DIR         optional: an existing fhir_packages/ to reuse
+#   BENCH_HOST_INSTANCE_TYPE  optional: machine type (cloud runners, PB-3)
+#   BENCH_HOST_IMAGE          optional: image id (cloud runners, PB-3)
+# plus bazel or bazelisk and python3 >= 3.11 on the runner's PATH.
+#
+# SECURITY: both repos are public. This workflow has no pull_request trigger
+# and must never get one -- a PR would run arbitrary code on the runner.
+# Workflow inputs and dispatch payloads reach shell steps only through env:,
+# never through ${{ }} inside a script.
+
+name: bench-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      fastfhir_ref:
+        description: FastFHIR ref to benchmark (tag, branch or SHA)
+        required: true
+        default: main
+      baseline_ref:
+        description: "Ref to compare against ('auto' = previous tag, else parent commit)"
+        required: true
+        default: auto
+      runner_label:
+        description: Self-hosted runner label
+        required: true
+        default: bench-local
+      quick:
+        description: Reduced ladder, no recovery sweep (never publishable)
+        type: boolean
+        default: true
+      publish:
+        description: Create/update the GitHub Release if the gate passes
+        type: boolean
+        default: false
+  # Sent by FastFHIR's release workflow (PB-4):
+  #   {"event_type": "fastfhir-release",
+  #    "client_payload": {"ref": "v1.2.3", "baseline": "auto", "runner": "bench-local"}}
+  # A dispatched run is always full and always publishes when the gate passes.
+  repository_dispatch:
+    types: [fastfhir-release]
+
+permissions:
+  contents: read
+
+env:
+  FASTFHIR_REF: ${{ inputs.fastfhir_ref || github.event.client_payload.ref }}
+  BASELINE_REF: ${{ inputs.baseline_ref || github.event.client_payload.baseline || 'auto' }}
+  QUICK: ${{ github.event_name == 'workflow_dispatch' && inputs.quick || false }}
+  RESULTS: results/ci
+
+jobs:
+  bench:
+    runs-on: [self-hosted, "${{ inputs.runner_label || github.event.client_payload.runner || 'bench-local' }}"]
+    # One benchmark per machine at a time: two concurrent runs would measure
+    # each other.
+    concurrency:
+      group: bench-${{ inputs.runner_label || github.event.client_payload.runner || 'bench-local' }}
+      cancel-in-progress: false
+    timeout-minutes: 720
+    outputs:
+      publishable: ${{ steps.gate.outputs.publishable }}
+      fastfhir_describe: ${{ steps.gate.outputs.fastfhir_describe }}
+      fastfhir_sha: ${{ steps.gate.outputs.fastfhir_sha }}
+      platform: ${{ steps.gate.outputs.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare corpus and Python
+        run: |
+          set -euo pipefail
+          [[ -n "${FASTFHIR_REF:-}" ]] || { echo "::error::no FastFHIR ref given"; exit 1; }
+          [[ -d "${BENCH_CORPUS_DIR:-}" ]] || {
+            echo "::error::BENCH_CORPUS_DIR is not set to a directory in the runner's .env"; exit 1; }
+          mkdir -p datasets   # untracked: a fresh checkout has no datasets/
+          ln -sfn "$BENCH_CORPUS_DIR" datasets/synthea
+          # A self-hosted workspace persists between runs; never let an older
+          # run's outputs leak into this one's figures or release.
+          rm -rf "$RESULTS" results/recovery_curve.csv results/_crashes.csv
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet -r requirements-bench.txt
+          echo "BENCH_HOST_RUNNER=${RUNNER_NAME}" >> "$GITHUB_ENV"
+
+      - name: A/B timing (interleaved)
+        run: |
+          set -uo pipefail
+          quick=(); [[ "$QUICK" == "true" ]] && quick=(--quick)
+          rc=0
+          .venv/bin/python scripts/bench_ab.py \
+            --candidate "$FASTFHIR_REF" --baseline "$BASELINE_REF" \
+            --out "$RESULTS" "${quick[@]}" || rc=$?
+          # 2 = cross-arm parity mismatch: the run is complete but the gate
+          # will refuse it. Anything else is a failure of the run itself.
+          if [[ "$rc" -eq 2 ]]; then
+            echo "::warning::cross-arm parity failed -- results are not publishable"
+          elif [[ "$rc" -ne 0 ]]; then
+            exit "$rc"
+          fi
+
+      - name: Artifacts, recovery sweep, figures (candidate)
+        run: |
+          set -euo pipefail
+          sha="$(.venv/bin/python -c 'import json,sys; print(json.load(open(sys.argv[1]))["sides"]["candidate"]["sha"])' "$RESULTS/ab.json")"
+          quick=(); [[ "$QUICK" == "true" ]] && quick=(--quick)
+          # Pin by SHA, not by the input ref: a branch may have moved since
+          # the timing step resolved it.
+          FIGURE_FORMAT=both PYTHON=.venv/bin/python \
+            scripts/run_benchmark.sh --fastfhir-ref "$sha" --skip-timing \
+            --results-dir "$RESULTS/candidate" "${quick[@]}"
+          if [[ -f results/recovery_curve.csv ]]; then
+            cp results/recovery_curve.csv "$RESULTS/candidate/"
+          fi
+
+      - name: Publish gate
+        id: gate
+        run: |
+          set -uo pipefail
+          .venv/bin/python scripts/publish_check.py "$RESULTS" \
+            --notes "$RESULTS/release-notes.md" --github-output "$GITHUB_OUTPUT" \
+            || echo "::warning::publish gate refused this run -- see the job summary"
+          cat "$RESULTS/release-notes.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results
+          path: |
+            ${{ env.RESULTS }}
+            !${{ env.RESULTS }}/bin
+          if-no-files-found: warn
+
+  publish:
+    needs: bench
+    if: >-
+      needs.bench.outputs.publishable == 'true' &&
+      (github.event_name == 'repository_dispatch' || inputs.publish)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DESCRIBE: ${{ needs.bench.outputs.fastfhir_describe }}
+      FASTFHIR_SHA: ${{ needs.bench.outputs.fastfhir_sha }}
+      PLATFORM: ${{ needs.bench.outputs.platform }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: bench-results
+          path: bench-results
+
+      - name: Create or update release
+        run: |
+          set -euo pipefail
+          tag="bench-fastfhir-${DESCRIBE}"
+          assets="$RUNNER_TEMP/assets"; mkdir -p "$assets"
+
+          # Stable, platform-suffixed names: the FastFHIR README links
+          # releases/latest/download/<name>, so these must not change.
+          cp bench-results/candidate/metrics.csv      "$assets/metrics-${PLATFORM}.csv"
+          cp bench-results/candidate/provenance.json  "$assets/provenance-${PLATFORM}.json"
+          cp bench-results/baseline/metrics.csv       "$assets/baseline-metrics-${PLATFORM}.csv"
+          cp bench-results/ab_summary.csv             "$assets/ab-summary-${PLATFORM}.csv"
+          cp bench-results/ab.json                    "$assets/ab-${PLATFORM}.json"
+          for f in bench-results/candidate/figures/*.svg bench-results/candidate/figures/*.png; do
+            [[ -e "$f" ]] || continue
+            name="$(basename "$f")"
+            cp "$f" "$assets/${name%.*}-${PLATFORM}.${name##*.}"
+          done
+          tar -czf "$assets/bench-results-${PLATFORM}.tar.gz" -C bench-results .
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # Another platform already published this revision: add ours.
+            gh release upload "$tag" "$assets"/* --clobber --repo "$GITHUB_REPOSITORY"
+            { gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json body -q .body
+              printf '\n\n---\n\n'; cat bench-results/release-notes.md; } > "$RUNNER_TEMP/notes.md"
+            gh release edit "$tag" --notes-file "$RUNNER_TEMP/notes.md" --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" "$assets"/* \
+              --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest \
+              --title "FastFHIR ${DESCRIBE} benchmark" \
+              --notes-file bench-results/release-notes.md
+          fi

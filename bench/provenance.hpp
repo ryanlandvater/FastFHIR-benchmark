@@ -155,7 +155,7 @@ inline constexpr std::size_t kSha256Len = 32;
 struct Provenance {
   // --- upstream identity (what library was actually measured)
   std::string fastfhir_path;
-  std::string fastfhir_path_source;  // "bazel external repo" | "workspace symlink"
+  std::string fastfhir_path_source;  // "bazel external repo" | "workspace symlink" | "operator"
   std::string fastfhir_sha;
   std::string fastfhir_tag;
   bool fastfhir_dirty = false;
@@ -721,6 +721,7 @@ inline void collect_host(Provenance& p) {
 
 struct Options {
   std::string profile_override;  // --profile
+  std::string fastfhir_root_override;  // --fastfhir-root (PB-2b)
   fs::path corpus_dir;
   std::uint64_t seed = 0;
 };
@@ -731,7 +732,14 @@ inline Provenance collect(const Options& opts) {
   p.seed = opts.seed;
 
   const fs::path bench_root = find_benchmark_root();
-  const FastfhirRoot ff = find_fastfhir_root(bench_root);
+  FastfhirRoot ff = find_fastfhir_root(bench_root);
+  if (!opts.fastfhir_root_override.empty()) {
+    // The caller vouches for the pairing (bench_ab.py checks the binary digest
+    // it recorded at build time); the tree must still exist to be described.
+    std::error_code ec;
+    const fs::path real = fs::canonical(opts.fastfhir_root_override, ec);
+    ff = ec ? FastfhirRoot{} : FastfhirRoot{real, "operator"};
+  }
   const fs::path& ff_root = ff.path;
   p.benchmark_path = bench_root.string();
   p.fastfhir_path = ff_root.string();

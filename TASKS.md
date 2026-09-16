@@ -151,6 +151,22 @@ Consequences:
 
 Newest first. One line per change, with what it did and did not settle.
 
+- **2026-09-16 (later)** — **PB-2a–c: workflow, same-box A/B, publish gate.**
+  - What changed: `bench-release.yml` runs interleaved A/B timing
+    (`scripts/bench_ab.py`), then the candidate's artifacts, sweep and figures,
+    then `scripts/publish_check.py`. It publishes only on a clean, full,
+    parity-passing run.
+  - New harness flags: `--replicate-first` and `--fastfhir-root`.
+  - Verified: both sides measure identical bundles, and each provenance names
+    its own commit. The smoke test turned out to be an A/A (a tests-only
+    commit gives a byte-identical binary) with paired ratios of 0.83–1.60 at a
+    1 run × 2 replicate ladder. That is the noise floor tiny ladders must never
+    be quoted against.
+  - **Not settled:**
+    - The workflow has not run on a real runner yet (PB-2d).
+    - The full-ladder noise floor on this Mac is unmeasured: run one A/A with
+      `--baseline` equal to the candidate.
+
 - **2026-09-16** — **PB-1: the library under test can be pinned.**
   - What changed: `scripts/pin_fastfhir.sh` and `run_benchmark.sh
     --fastfhir-ref` build against a clean checkout at one commit and profile.
@@ -1326,7 +1342,7 @@ That is intentional coverage proving the fallback is lossless — **do not enabl
 
 ## ▶ PB — publishable benchmark pipeline
 
-**Status** OPEN · PB-1 ✅ 2026-09-16 · direction agreed with Ryan 2026-09-16 ·
+**Status** OPEN · PB-1 ✅ · PB-2a–c ✅ (PB-2d needs a registered runner) · direction agreed with Ryan 2026-09-16 ·
 cloud: **Google Cloud** (Ryan's preference) · work top to bottom
 
 **Goal.** A FastFHIR release triggers a benchmark of *that* release on
@@ -1445,16 +1461,84 @@ FastFHIR-benchmark: bench-release.yml
 
 ### PB-2 — the workflow, on a local self-hosted runner
 
-- [ ] **PB-2a.** `.github/workflows/bench-release.yml`: `workflow_dispatch`
-      (inputs: `fastfhir_ref`, `baseline_ref`, `quick`), later
-      `repository_dispatch`.
-- [ ] **PB-2b.** Same-box A/B: run the ladder for `fastfhir_ref` and
-      `baseline_ref`, alternating runs between them. Needs a harness or script
-      mode that alternates at replicate granularity, not two back-to-back runs.
-- [ ] **PB-2c.** Publish job: gate (see above), then `gh release create
-      bench-fastfhir-<tag>` with metrics, provenance, run log and figures (SVG
-      for the README).
-- [ ] **PB-2d.** Prove it end to end with Ryan's Mac as the runner.
+- [x] **PB-2a. Workflow.** ✅ 2026-09-16
+      [`.github/workflows/bench-release.yml`](.github/workflows/bench-release.yml).
+      - Triggers: `workflow_dispatch` (inputs `fastfhir_ref`, `baseline_ref`
+        default `auto`, `runner_label` default `bench-local`, `quick` default
+        **on**, `publish` default off) and `repository_dispatch` type
+        `fastfhir-release`. A dispatched run is always full and publishes if
+        the gate passes.
+      - **No `pull_request` trigger, ever:** both repos are public.
+      - Inputs and payloads reach the shell only through `env:`.
+      - One run per runner label (`concurrency`); 12 h timeout.
+      - Runner `.env` supplies `BENCH_CORPUS_DIR` (the workflow links
+        `datasets/synthea` to it) and, optionally, `FHIR_PACKAGES_DIR` and
+        `BENCH_HOST_*`.
+      - The workflow creates `datasets/` itself: neither it nor
+        `artifacts/.keep` is tracked, despite `.gitignore` expecting them.
+      - Python deps are pinned in [`requirements-bench.txt`](requirements-bench.txt).
+      - Also fixed: `.gitignore` excluded only `/bazel-fastfhir-benchmark`
+        (lowercase). On Linux the link is `bazel-FastFHIR-benchmark`, so every
+        CI checkout would have read as dirty. It is now `/bazel-*`.
+- [x] **PB-2b. Same-box A/B.** ✅ 2026-09-16
+      [`scripts/bench_ab.py`](scripts/bench_ab.py).
+      - Builds: pins both refs and builds the baseline first, so `bazel-bin/`
+        ends on the candidate. Each copied binary's SHA-256 is recorded with
+        its tree and re-checked before every invocation.
+      - Timing: one process per (side, size, replicate), in ABBA order.
+      - New harness flags: `--replicate-first N` (a replicate's bundle depends
+        only on seed, size and index) and `--fastfhir-root DIR` (provenance
+        source `operator`). Bazel's link names only the last build, so it
+        would mislabel the other side.
+      - Outputs: `candidate/` and `baseline/` in the normal `metrics.csv` and
+        `provenance.json` format, `ab_summary.csv` (medians plus the **paired**
+        per-replicate ratio with min/max), and `ab.json`.
+      - Exit 2 on any parity failure; the run still completes.
+      - Verified: both sides measure identical bundles (0 mismatches across all
+        keys), and each provenance names its own SHA.
+      - `--baseline auto` = newest tag before the candidate, else its parent.
+        FastFHIR has no tags yet.
+      - **Finding: an A/A is detected by binary digest, not by ref.** The smoke
+        test compared `ee578e4` against `4703c71`. `ee578e4` changed only
+        tests, so both binaries were byte-identical. Paired ratios still ranged
+        **0.83–1.60** at 1 run × 2 replicates on this Mac.
+        - That spread is the noise floor of a tiny ladder, and it is why
+          `--quick` can never publish.
+        - `ab.json` sets `a_a`, and the release notes say so.
+      - Process startup is ≈2.4 s, which adds ≈11 min over a full two-sided
+        ladder. Acceptable.
+- [x] **PB-2c. Publish job and gate.** ✅ 2026-09-16
+      [`scripts/publish_check.py`](scripts/publish_check.py) checks that:
+      - `ab.json` is complete, the run was not quick, and parity held;
+      - both provenance files exist (the harness writes them only when
+        complete) with `opt`;
+      - neither FastFHIR tree nor the benchmark checkout is dirty;
+      - each provenance SHA matches the SHA `ab.json` says that side built.
+
+      It writes release notes (a provenance table, plus the FastFHIR-arm
+      paired ratios at the largest size) into the job summary, whether or not
+      the gate passes.
+
+      The publish job (ubuntu, `contents: write`) creates
+      `bench-fastfhir-<describe>` as `--latest`, or adds this platform's
+      assets to a release another platform already created.
+      - Asset names are stable and platform-suffixed, e.g.
+        `fig1_duration_by_stage-linux-x86_64.svg`, `metrics-<platform>.csv`,
+        and `bench-results-<platform>.tar.gz`.
+      - Rehearsed locally: the gate correctly refused (dirty checkout), and
+        every figure rendered as SVG and PNG.
+- [ ] **PB-2d. Prove it end to end on Ryan's Mac.** Needs Ryan:
+      1. Register a runner with label `bench-local` (Settings → Actions →
+         Runners).
+      2. Put `BENCH_CORPUS_DIR=/Users/ryanlandvater/GitHub/FastFHIR/build/synthea_fhir_r4`
+         in the runner's `.env`.
+      3. Start it with `./run.sh`, then dispatch `bench-release` with the
+         defaults (quick).
+
+      Expected: green, gate refuses as *quick*. Then do one full run with
+      `publish` on.
+      - Not yet exercised: the workflow YAML itself (no `actionlint` here),
+        `upload-artifact` exclusions, and the release commands.
 
 ### PB-3 — cloud runner (Google Cloud)
 

@@ -1,0 +1,5 @@
+# Python for scripts/ (figures, recovery sweep, A/B driver). Pinned to the
+# versions the published figures were rendered with; bump deliberately.
+matplotlib==3.11.1
+numpy==2.5.2
+pandas==3.0.5
