@@ -151,6 +151,22 @@ Consequences:
 
 Newest first. One line per change, with what it did and did not settle.
 
+- **2026-09-16** — **PB-1: the library under test can be pinned.**
+  - What changed: `scripts/pin_fastfhir.sh` and `run_benchmark.sh
+    --fastfhir-ref` build against a clean checkout at one commit and profile.
+    `provenance.json` now names the tree Bazel actually compiled and records
+    host details.
+  - Verified: a quick run pinned to `ee578e4` exits 0, all four arms handle
+    412/412 resources at every stage, and the pinned `generated_src` is
+    byte-identical to the live one.
+  - Build fix: Xcode 27 broke the build ("absolute path inclusion" of
+    `SDKSettings.json`). `MODULE.bazel` now declares `apple_support` first so
+    its Apple toolchain wins toolchain resolution.
+  - **Not settled:**
+    - The corpus still links into `../FastFHIR/build/` (PB-3b).
+    - Same-box A/B (PB-2b) does not exist yet.
+    - Cloud choice is Google Cloud; nothing under `infra/` exists yet.
+
 - **2026-08-26 (review)** — Reviewing the D4/lens/compact commit surfaced
   **PA-14 / CAPI-13**: `as<ObservationData>()` drops singular block fields, so
   `Observation.code` and `subject` have never reached any arm's output and the
@@ -1308,9 +1324,186 @@ That is intentional coverage proving the fallback is lossless — **do not enabl
 
 ---
 
+## ▶ PB — publishable benchmark pipeline
+
+**Status** OPEN · PB-1 ✅ 2026-09-16 · direction agreed with Ryan 2026-09-16 ·
+cloud: **Google Cloud** (Ryan's preference) · work top to bottom
+
+**Goal.** A FastFHIR release triggers a benchmark of *that* release on
+disclosed, rentable hardware. The result is attached to a GitHub Release here,
+and the FastFHIR README links it.
+
+**Why not the obvious hosts.**
+- **GitHub-hosted runners:** underpowered, and shared with other tenants.
+- **Ryan's machine:** fixed hardware, but nobody else can rent it to reproduce a
+  number. It stays the fallback runner and the development loop.
+
+**Architecture (agreed):**
+
+```
+FastFHIR: push tag vX.Y.Z
+  └─ release.yml: build, GitHub Release (source tarball + generated_src)
+       └─ repository_dispatch → FastFHIR-benchmark  {tag, sha}
+
+FastFHIR-benchmark: bench-release.yml
+  job 1 (ubuntu-latest): create bare-metal GCE VM from a Packer image, register ephemeral runner
+  job 2 (that instance):    pin FastFHIR@sha → scripts/run_benchmark.sh → gates
+  job 3 (ubuntu-latest): release bench-fastfhir-vX.Y.Z (metrics.csv,
+                         provenance.json, figures); ALWAYS delete the VM
+```
+
+- **GitHub Actions runs the pipeline; the GCE VM only runs the benchmark job.**
+  - Terraform (`google` provider) owns only the long-lived pieces: Workload
+    Identity Federation for GitHub OIDC, a least-privilege service account, an
+    instance template, an outbound-only firewall, and the Packer image
+    (`googlecompute` builder).
+  - **Terraform is cloud-agnostic as a tool, not as a config.** The resources
+    are provider-specific, so moving clouds means rewriting `infra/`, not
+    re-pointing it. Keep everything cloud-specific inside `infra/` and the
+    workflow's create/delete steps.
+  - **Do not `terraform apply`/`destroy` per run.** A cancelled job leaves a
+    running bare-metal VM and a locked state file.
+  - Create and delete the VM from the workflow instead:
+    - `google-github-actions/auth`, then `gcloud compute instances create`.
+    - A startup script registers an ephemeral runner using a just-in-time
+      runner config.
+    - Put the delete step under `if: always()`.
+    - GCP has no maintained equivalent of AWS's `ec2-github-runner` action, so
+      this glue is ours; keep it small.
+- **A cloud VM is not quieter than a laptop by default.** Credibility comes from:
+  - **Bare-metal machine types** (GCE `*-metal`, e.g. the C3 bare-metal
+    shapes): no hypervisor and no neighbours, and the governor, turbo and SMT
+    settings can be changed. Pin cores with `taskset`.
+    - Check current metal availability per region before committing.
+    - If arm64 (Axion) has no metal shape, the fallback is a sole-tenant node,
+      recorded as such.
+    - Metal shapes may need quota and have no spot option.
+  - **x86_64 and arm64 both.** One CPU family does not support the claim.
+  - **Same-box A/B.** Every run also measures the *previous* release,
+    alternating runs with the new one. Two instances of one type differ by a
+    few percent; two builds on one box do not.
+  - **Disclosure.** The instance type, image, kernel, CPU model, microcode and
+    governor/SMT state go into `provenance.json`. A machine family does not
+    pin the exact CPU stepping or microcode.
+- **Publish gate:** the harness exits 0 (parity clean) **and** provenance is
+  complete **and** `fastfhir_dirty == false`. Automation does not fix the open
+  **PA** items; until they close, the pipeline runs but does not publish.
+- **README reference:**
+  `https://github.com/ryanlandvater/FastFHIR-benchmark/releases/latest/download/<fig>.svg`
+  for the headline figure, and the versioned release for the data.
+
+### PB-1 — pin the library under test (this repo, local first)
+
+- [x] **PB-1a. A pinned FastFHIR checkout, not the live tree.** ✅ 2026-09-16
+      - [`scripts/pin_fastfhir.sh`](scripts/pin_fastfhir.sh) `REF [--profile P]
+        [--repo URL|PATH]` keeps a bare mirror at `.external/pins/FastFHIR.git`.
+      - It creates one detached checkout per (commit, profile):
+        `.external/pins/fastfhir-<sha12>-<profile>`.
+      - It refuses a checkout that has moved or become dirty, and prints the
+        path on its last line.
+      - [`scripts/run_benchmark.sh`](scripts/run_benchmark.sh)
+        `--fastfhir-ref REF [--fastfhir-repo R]` runs it as stage 0 and passes
+        `--override_module=fastfhir=<pin>` to every bazel call.
+      - The plan prints "live tree -- not publishable" when no ref is given.
+      - `MODULE.bazel`'s `local_path_override` is unchanged, so it stays the
+        developer default.
+      - New [`.bazelignore`](.bazelignore) excludes `.external`: pinned trees
+        carry their own BUILD files and must never load as packages here.
+      - Not `archive_override`: a tarball has no `.git`, so provenance could not
+        establish the SHA from the tree.
+- [x] **PB-1b. Generate the profile deterministically.** ✅ 2026-09-16
+      - The pin script runs `python -m generator` (≥ 3.11) in the pinned tree
+        from an empty `generated_src/`, then writes the `.profile` stamp only
+        on success, mirroring `../FastFHIR/CMakeLists.txt:182-197`.
+      - Profile source: `--profile`, else the pinned commit's own
+        `CMakePresets.json` base preset.
+      - `fhir_packages/` is reused by symlink and excluded through the clone's
+        `.git/info/exclude`. Upstream's ignore rule `fhir_packages/` matches
+        only a directory, so the symlink would otherwise read as dirty.
+      - **Verified:** the pin of `ee578e4` at the shipped profile generates a
+        tree **byte-identical** to the live `../FastFHIR/generated_src`
+        (`diff -rq` clean). Pinning takes 3.6 s; a repeat reuses the pin.
+      - CI still needs network access or a cached `fhir_packages/` (PB-3b).
+- [x] **PB-1c. Provenance names the tree Bazel compiled.** ✅ 2026-09-16
+      - `find_fastfhir_root()` resolves `bazel-<ws>/external/fastfhir~`
+        (and `+` for Bazel 8) before the workspace symlink.
+      - New field `fastfhir_path_source`.
+      - **Verified:** a pinned quick run records the pin path with source
+        `bazel external repo`, `fastfhir_dirty: false`, and profile source
+        `generated-tree stamp`.
+      - Caveat: the link reflects the **last build**, so `--skip-build` with a
+        ref prints a warning.
+- [x] **PB-1d. Host disclosure fields (recorded, not gated).** ✅ 2026-09-16
+      - New fields: `kernel`, `logical_cpus`, `memory_bytes`, `cpu_microcode`,
+        `cpu_governor`, `smt_control`, `turbo`.
+      - From the environment: `BENCH_HOST_INSTANCE_TYPE`, `BENCH_HOST_IMAGE`,
+        `BENCH_HOST_RUNNER`.
+      - Printed in the stderr summary. The `/sys` fields are empty on macOS by
+        design.
+      - Also fixed: `generated_resources` counted `ChoiceBlock` and
+        `Conformance_Layer` as resource types (38 reported; 36 real at `ee578e4`).
+
+### PB-2 — the workflow, on a local self-hosted runner
+
+- [ ] **PB-2a.** `.github/workflows/bench-release.yml`: `workflow_dispatch`
+      (inputs: `fastfhir_ref`, `baseline_ref`, `quick`), later
+      `repository_dispatch`.
+- [ ] **PB-2b.** Same-box A/B: run the ladder for `fastfhir_ref` and
+      `baseline_ref`, alternating runs between them. Needs a harness or script
+      mode that alternates at replicate granularity, not two back-to-back runs.
+- [ ] **PB-2c.** Publish job: gate (see above), then `gh release create
+      bench-fastfhir-<tag>` with metrics, provenance, run log and figures (SVG
+      for the README).
+- [ ] **PB-2d.** Prove it end to end with Ryan's Mac as the runner.
+
+### PB-3 — cloud runner (Google Cloud)
+
+- [ ] **PB-3a.** `infra/terraform/` (`google` provider):
+      - Workload Identity pool and provider restricted to this repo.
+      - A service account allowed only to create and delete labelled VMs in one
+        project and zone.
+      - An instance template and an outbound-only firewall.
+      - Remote state in a GCS bucket (GCS locks natively).
+- [ ] **PB-3b.** `infra/packer/` (`googlecompute` builder): Ubuntu LTS image
+      with the toolchain, Bazel 7.7.1, Python ≥ 3.11, a warm Bazel repository
+      cache, `fhir_packages/`, and the Synthea corpus.
+      - **The corpus is not self-contained today.** `datasets/synthea` links to
+        `../FastFHIR/build/synthea_fhir_r4` (342 docs, 1.29 GB, sha256
+        `958b1ceb2642…`).
+      - The image must build the corpus from a pinned source, or store that
+        exact directory (e.g. in a GCS bucket) and check it against
+        `corpus_sha256`.
+- [ ] **PB-3c.** Host tuning step before timing: `performance` governor, turbo
+      off, SMT off, `taskset` pinning. Record every setting (PB-1d).
+- [ ] **PB-3d.** Matrix x86_64 + arm64; each arch gets its own release assets.
+- [ ] **PB-3e.** Measure one full run's wall time on the VM and record the cost
+      per release here.
+
+### PB-4 — upstream trigger (FastFHIR repo — Ryan's to commit, not ours)
+
+- [ ] **PB-4a.** FastFHIR has **no workflows and no tags** (checked
+      2026-09-16). It needs a `release.yml` on tag push: build, test, and a
+      GitHub Release whose source asset includes `generated_src/` for the
+      shipped profile.
+- [ ] **PB-4b.** `repository_dispatch` to this repo with `{tag, sha}`, using a
+      fine-grained PAT or a GitHub App token. Fallback without a shared
+      secret: a scheduled job here that checks FastFHIR's releases.
+- [ ] **PB-4c.** FastFHIR README: embed the `releases/latest/download` figure
+      and link the versioned release.
+
+### PB-5 — publication readiness
+
+- [ ] **PB-5a.** The harness exits 0: close the open **PA** items (HL7v2
+      `obs_issued_present` / `obs_component_value_*`, Test 1 parity).
+- [ ] **PB-5b.** Remove "results not yet publishable" from README only when
+      PB-5a holds on the cloud runner.
+
+---
+
 ## ▶ PR — build provenance with every result
 
-**Status** OPEN · folded into **IN-0**, kept here for the detail
+**Status** PR-1/PR-3 closed; PR-2 is enforced at publish time by **PB**. The
+remaining pinning work is **PB-1**.
 
 The compiled profile changes the binary under test with **no Bazel-visible
 signal**: `.external/FastFHIR` is a symlink to the live tree; Bazel does not run
@@ -1322,11 +1515,14 @@ Current upstream state (verified 2026-08-24): profile
 `us-core,billing,medication-admin,supply`; 80 code-system enums; 44 generated
 `.cpp`; 37 resource types; `ImagingStudy` **not** compiled.
 
-- [ ] **PR-1.** Emit profile, upstream git SHA, dirty flag, and
+- [x] **PR-1.** Emit profile, upstream git SHA, dirty flag, and
       `--compilation_mode` into the results CSV and the PG schema.
-- [ ] **PR-2.** Fail the run if `.external/FastFHIR` has uncommitted changes, or
-      record the dirty state in the metadata.
-- [ ] **PR-3.** Document that a profile change requires
+      *Done by IN-0 (`provenance.json` + `benchmark_runs` columns).*
+- [x] **PR-2.** Fail the run if `.external/FastFHIR` has uncommitted changes, or
+      record the dirty state in the metadata. *Recorded (`fastfhir_dirty`) by
+      IN-0; the PB publish gate refuses a dirty tree.*
+- [x] **PR-3.** *Upstream CMake now refuses a mismatched profile and prints
+      this instruction (`../FastFHIR/CMakeLists.txt:151-170`).* Document that a profile change requires
       `rm -rf ../FastFHIR/generated_src` before regenerating — the generator
       never deletes output it no longer emits, so a stale tree survives.
 

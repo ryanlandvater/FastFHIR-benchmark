@@ -46,6 +46,8 @@ BUNDLE_TARGETS_MB="${BUNDLE_TARGETS_MB:-1,2,4,8,16,32,64}"
 BUNDLE_MAX_MB="${BUNDLE_MAX_MB:-64}"
 SEED="${SEED:-20260825}"
 PROFILE="${PROFILE:-}"                   # pin FASTFHIR_PRODUCTION_PROFILE
+FASTFHIR_REF="${FASTFHIR_REF:-}"         # benchmark a pinned commit, not the live tree
+FASTFHIR_REPO="${FASTFHIR_REPO:-}"       # where FASTFHIR_REF is fetched from
 FIGURE_FORMAT="${FIGURE_FORMAT:-png}"
 # Passed through verbatim to recovery_sweep.py. Empty today -- the sweep takes
 # no arguments (see --quick below); this is the seam for when it does.
@@ -86,6 +88,13 @@ Usage: scripts/run_benchmark.sh [options]
   --profile STR       Pin FASTFHIR_PRODUCTION_PROFILE. Needed only when the
                       generated-tree stamp cannot resolve it and the harness
                       calls the profile ambiguous (it then exits 3).
+  --fastfhir-ref REF  Benchmark FastFHIR at REF (tag/branch/SHA) from a clean
+                      pinned checkout (scripts/pin_fastfhir.sh) instead of the
+                      live .external/FastFHIR tree. Required for anything
+                      published. --profile then selects the generated profile;
+                      without it the pinned commit's base preset decides.
+  --fastfhir-repo R   Fetch --fastfhir-ref from R (URL or local path; default
+                      the GitHub repo). A local path reaches unpushed commits.
   --replicates N      Distinct bundle draws per size           (default 20)
   --runs N            Timed repetitions per replicate          (default 3)
   --targets-mb LIST   Sweep ladder, comma separated            (default 1,2,4,8,16,32,64)
@@ -106,7 +115,8 @@ Usage: scripts/run_benchmark.sh [options]
 
 Environment: RESULTS_DIR FIGURES_DIR ARTIFACTS_DIR RUNS REPLICATES
 WARMUP_ITERATIONS BUNDLE_TARGETS_MB BUNDLE_MAX_MB SEED PROFILE FIGURE_FORMAT
-RECOVERY_SWEEP_ARGS BAZEL PYTHON
+FASTFHIR_REF FASTFHIR_REPO RECOVERY_SWEEP_ARGS BAZEL PYTHON
+BENCH_HOST_INSTANCE_TYPE BENCH_HOST_IMAGE BENCH_HOST_RUNNER (recorded in provenance)
 EOF
 }
 
@@ -130,6 +140,8 @@ while [[ $# -gt 0 ]]; do
     --figures-dir)    FIGURES_DIR="${2:?--figures-dir needs a directory}"; shift ;;
     --artifacts-dir)  ARTIFACTS_DIR="${2:?--artifacts-dir needs a directory}"; shift ;;
     --profile)        PROFILE="${2:?--profile needs a value}"; shift ;;
+    --fastfhir-ref)   FASTFHIR_REF="${2:?--fastfhir-ref needs a ref}"; shift ;;
+    --fastfhir-repo)  FASTFHIR_REPO="${2:?--fastfhir-repo needs a URL or path}"; shift ;;
     --runs)           RUNS="${2:?--runs needs a number}"; RUNS_SET=1; shift ;;
     --replicates)     REPLICATES="${2:?--replicates needs a number}"; shift ;;
     --targets-mb)     BUNDLE_TARGETS_MB="${2:?--targets-mb needs a list}"; TARGETS_SET=1; shift ;;
@@ -201,10 +213,33 @@ fi
 # that dies takes its producer down with a SIGPIPE mid-sweep.
 mkdir -p "$RESULTS_DIR"
 
+# --- 0. pin ------------------------------------------------------------------
+# With a ref, the library under test is a clean checkout at that commit and
+# Bazel is pointed at it with --override_module. The profile then goes to the
+# generator, not to the harness: the harness reads the pinned tree's
+# generated_src/.profile stamp, which is evidence rather than an assertion.
+BAZEL_FLAGS=()
+FASTFHIR_PIN=""
+if [[ -n "$FASTFHIR_REF" ]]; then
+  stage "0/5 pin FastFHIR @ $FASTFHIR_REF"
+  pin_args=("$FASTFHIR_REF")
+  [[ -n "$PROFILE" ]] && pin_args+=(--profile "$PROFILE")
+  [[ -n "$FASTFHIR_REPO" ]] && pin_args+=(--repo "$FASTFHIR_REPO")
+  FASTFHIR_PIN="$(PYTHON="$PYTHON" scripts/pin_fastfhir.sh "${pin_args[@]}" | tail -n 1)" \
+    || die "could not pin FastFHIR at $FASTFHIR_REF"
+  BAZEL_FLAGS+=("--override_module=fastfhir=$FASTFHIR_PIN")
+  PROFILE=""
+  if [[ "$DO_BUILD" -eq 0 ]]; then
+    echo "  WARNING --skip-build: the binaries were built from whatever tree the last build used;"
+    echo "          provenance reports that tree, which may not be this pin."
+  fi
+fi
+
 stage "plan"
 echo "  mode          $([[ "$QUICK" -eq 1 ]] && echo quick || echo full)"
 echo "  bazel         $BAZEL"
 echo "  python        $PYTHON"
+echo "  fastfhir      ${FASTFHIR_PIN:-live tree (.external/FastFHIR) -- not publishable}"
 echo "  results       $RESULTS_DIR"
 echo "  figures       $FIGURES_DIR"
 echo "  artifacts     $ARTIFACTS_DIR"
@@ -217,12 +252,12 @@ fi
 # --- 1. build --------------------------------------------------------------
 if [[ "$DO_BUILD" -eq 1 ]]; then
   stage "1/5 build (bazel -c opt)"
-  "$BAZEL" build -c opt //bench:bench_harness //bench:bench_test_5 \
+  "$BAZEL" build -c opt ${BAZEL_FLAGS[@]+"${BAZEL_FLAGS[@]}"} //bench:bench_harness //bench:bench_test_5 \
     || die "build failed"
 
   if [[ "$WITH_TESTS" -eq 1 ]]; then
     stage "1b/5 gates (timing conformance + provenance)"
-    "$BAZEL" test -c opt //bench:timing_conformance_test //bench:provenance_test \
+    "$BAZEL" test -c opt ${BAZEL_FLAGS[@]+"${BAZEL_FLAGS[@]}"} //bench:timing_conformance_test //bench:provenance_test \
       || die "gate tests failed -- do not publish numbers from this tree"
   fi
 else

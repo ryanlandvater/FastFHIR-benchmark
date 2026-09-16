@@ -99,6 +99,17 @@ Current upstream state (verified 2026-08-24, head `a9fd4e9`):
 
 **Record the profile and the upstream git SHA with every result you publish.**
 
+**For anything published, pin it instead** (TASKS.md PB-1):
+
+```bash
+scripts/run_benchmark.sh --fastfhir-ref <tag|sha>
+```
+
+This builds against a clean checkout at that commit, with `generated_src/`
+regenerated at the commit's own shipped profile, via Bazel's
+`--override_module`. `provenance.json` then records that tree
+(`fastfhir_path_source: "bazel external repo"`) rather than the symlink.
+
 After any profile change, `rm -rf ../FastFHIR/generated_src` before
 regenerating — the generator never deletes output it no longer emits, so a
 stale tree survives the change and produces confusing compile errors.

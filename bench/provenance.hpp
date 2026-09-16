@@ -26,6 +26,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -35,6 +36,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #if defined(__APPLE__)
@@ -153,6 +155,7 @@ inline constexpr std::size_t kSha256Len = 32;
 struct Provenance {
   // --- upstream identity (what library was actually measured)
   std::string fastfhir_path;
+  std::string fastfhir_path_source;  // "bazel external repo" | "workspace symlink"
   std::string fastfhir_sha;
   std::string fastfhir_tag;
   bool fastfhir_dirty = false;
@@ -175,6 +178,22 @@ struct Provenance {
   std::string os;
   std::string arch;
   std::string cpu_model;
+
+  // --- host disclosure (TASKS.md PB-1d). Recorded, never gated: macOS has no
+  // /sys, and a laptop run is still a valid development record. Empty or -1
+  // means "not observable here".
+  std::string kernel;
+  int logical_cpus = -1;
+  std::int64_t memory_bytes = -1;
+  std::string cpu_microcode;
+  std::string cpu_governor;
+  std::string smt_control;
+  std::string turbo;  // "on" | "off"
+  // Set by the workflow, which knows what the harness cannot see from inside
+  // the guest: BENCH_HOST_INSTANCE_TYPE, BENCH_HOST_IMAGE, BENCH_HOST_RUNNER.
+  std::string host_instance_type;
+  std::string host_image;
+  std::string host_runner;
 
   // --- corpus
   std::string corpus_id;
@@ -295,15 +314,37 @@ inline fs::path find_benchmark_root() {
   return {};
 }
 
-// `.external/FastFHIR` is a symlink to the live tree -- canonical() is the
-// point, not a convenience: the record must name the tree that was compiled.
-inline fs::path find_fastfhir_root(const fs::path& bench_root) {
+// The record must name the tree that was COMPILED, so canonical() is the point,
+// not a convenience.
+//
+// Bazel's own link is asked first: bazel-<workspace>/external/fastfhir~ is what
+// the last build resolved the module to, whether through MODULE.bazel's
+// local_path_override (the .external/FastFHIR symlink) or through
+// --override_module=fastfhir=<pinned checkout> (TASKS.md PB-1). Reading the
+// symlink alone would name the live tree for a pinned build. `~` is Bazel 7's
+// canonical-name separator; Bazel 8 uses `+`.
+struct FastfhirRoot {
+  fs::path path;
+  std::string source;
+};
+
+inline FastfhirRoot find_fastfhir_root(const fs::path& bench_root) {
   std::error_code ec;
+  if (bench_root.empty()) return {};
+  const fs::path bazel_external =
+      bench_root / ("bazel-" + bench_root.filename().string()) / "external";
+  for (const char* name : {"fastfhir~", "fastfhir+"}) {
+    const fs::path candidate = bazel_external / name;
+    if (fs::exists(candidate / "BUILD.bazel", ec)) {
+      const fs::path real = fs::canonical(candidate, ec);
+      if (!ec) return {real, "bazel external repo"};
+    }
+  }
   for (const fs::path& candidate : {bench_root / ".external" / "FastFHIR",
                                     bench_root.parent_path() / "FastFHIR"}) {
     if (fs::exists(candidate, ec)) {
       const fs::path real = fs::canonical(candidate, ec);
-      if (!ec) return real;
+      if (!ec) return {real, "workspace symlink"};
     }
   }
   return {};
@@ -536,7 +577,8 @@ inline void collect_generated_evidence(const fs::path& fastfhir_root, Provenance
       // counting those as resource types overstates the profile's coverage,
       // which is the exact number this field exists to corroborate.
       static const std::set<std::string> kNotResources = {
-          "DataTypes", "Reflection", "FieldKeys", "IngestMappings", "AllTypes", "CodeSystems", "Codes"};
+          "DataTypes", "Reflection", "FieldKeys", "IngestMappings", "AllTypes", "CodeSystems", "Codes",
+          "ChoiceBlock", "Conformance_Layer"};
       const bool is_dictionary = stem.find("Dictionary") != std::string::npos;
       if (!is_dictionary && !kNotResources.count(stem)) p.generated_resources.push_back(stem);
     }
@@ -606,6 +648,73 @@ inline std::string now_iso8601() {
   return buf;
 }
 
+// First line of a small /proc or /sys file, trimmed; empty when absent.
+inline std::string read_first_line(const fs::path& path) {
+  std::ifstream in(path);
+  std::string line;
+  if (!in || !std::getline(in, line)) return {};
+  return trim(line);
+}
+
+inline std::string env_or_empty(const char* name) {
+  const char* v = std::getenv(name);
+  return v ? trim(v) : std::string();
+}
+
+// What a reviewer needs to rent the same box and get the same number. None of
+// it is gated: most of it does not exist on macOS.
+inline void collect_host(Provenance& p) {
+  p.kernel = capture("uname -r");
+  const unsigned hc = std::thread::hardware_concurrency();
+  if (hc > 0) p.logical_cpus = static_cast<int>(hc);
+
+#if defined(__APPLE__)
+  std::uint64_t mem = 0;
+  std::size_t len = sizeof(mem);
+  if (::sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) == 0) {
+    p.memory_bytes = static_cast<std::int64_t>(mem);
+  }
+#elif defined(__linux__)
+  {
+    std::ifstream in("/proc/meminfo");
+    std::string key;
+    std::int64_t kib = 0;
+    while (in >> key >> kib) {
+      if (key == "MemTotal:") {
+        p.memory_bytes = kib * 1024;
+        break;
+      }
+      in.ignore(64, '\n');
+    }
+  }
+  {
+    std::ifstream in("/proc/cpuinfo");
+    std::string line;
+    while (std::getline(in, line)) {
+      const auto colon = line.find(':');
+      if (colon != std::string::npos && trim(line.substr(0, colon)) == "microcode") {
+        p.cpu_microcode = trim(line.substr(colon + 1));
+        break;
+      }
+    }
+  }
+  p.cpu_governor = read_first_line("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor");
+  p.smt_control = read_first_line("/sys/devices/system/cpu/smt/control");
+  // intel_pstate inverts the sense; the generic cpufreq knob does not.
+  if (const std::string no_turbo = read_first_line("/sys/devices/system/cpu/intel_pstate/no_turbo");
+      !no_turbo.empty()) {
+    p.turbo = no_turbo == "1" ? "off" : "on";
+  } else if (const std::string boost = read_first_line("/sys/devices/system/cpu/cpufreq/boost");
+             !boost.empty()) {
+    p.turbo = boost == "1" ? "on" : "off";
+  }
+#endif
+
+  p.host_instance_type = env_or_empty("BENCH_HOST_INSTANCE_TYPE");
+  p.host_image = env_or_empty("BENCH_HOST_IMAGE");
+  p.host_runner = env_or_empty("BENCH_HOST_RUNNER");
+}
+
 // ---------------------------------------------------------------------------
 // Collection
 // ---------------------------------------------------------------------------
@@ -622,9 +731,11 @@ inline Provenance collect(const Options& opts) {
   p.seed = opts.seed;
 
   const fs::path bench_root = find_benchmark_root();
-  const fs::path ff_root = find_fastfhir_root(bench_root);
+  const FastfhirRoot ff = find_fastfhir_root(bench_root);
+  const fs::path& ff_root = ff.path;
   p.benchmark_path = bench_root.string();
   p.fastfhir_path = ff_root.string();
+  p.fastfhir_path_source = ff.source;
 
   if (!bench_root.empty()) {
     const std::string q = "git -C '" + bench_root.string() + "' ";
@@ -677,6 +788,7 @@ inline Provenance collect(const Options& opts) {
   p.arch = "x86_64";
 #endif
   p.cpu_model = detect_cpu_model();
+  collect_host(p);
 
   if (!opts.corpus_dir.empty()) {
     const fs::path cache = bench_root.empty() ? fs::path(".corpus_sha256.cache")
@@ -762,6 +874,7 @@ inline std::string to_json(const Provenance& p) {
   o << "{\n";
   str("generated_at", p.generated_at);
   str("fastfhir_path", p.fastfhir_path);
+  str("fastfhir_path_source", p.fastfhir_path_source);
   str("fastfhir_sha", p.fastfhir_sha);
   str("fastfhir_tag", p.fastfhir_tag);
   boolean("fastfhir_dirty", p.fastfhir_dirty);
@@ -779,6 +892,16 @@ inline std::string to_json(const Provenance& p) {
   str("os", p.os);
   str("arch", p.arch);
   str("cpu_model", p.cpu_model);
+  str("kernel", p.kernel);
+  num("logical_cpus", p.logical_cpus);
+  num("memory_bytes", p.memory_bytes);
+  str("cpu_microcode", p.cpu_microcode);
+  str("cpu_governor", p.cpu_governor);
+  str("smt_control", p.smt_control);
+  str("turbo", p.turbo);
+  str("host_instance_type", p.host_instance_type);
+  str("host_image", p.host_image);
+  str("host_runner", p.host_runner);
   str("corpus_id", p.corpus_id);
   str("corpus_sha256", p.corpus_sha256);
   num("corpus_doc_count", p.corpus_doc_count);
@@ -803,6 +926,13 @@ inline std::string to_summary(const Provenance& p) {
     << p.generated_resources.size() << " resource types\n"
     << "[provenance] build " << p.compilation_mode << " " << p.compiler << " " << p.compiler_version
     << " on " << p.os << "/" << p.arch << " (" << p.cpu_model << ")\n"
+    << "[provenance] host " << (p.host_instance_type.empty() ? "local" : p.host_instance_type)
+    << ", kernel " << (p.kernel.empty() ? "?" : p.kernel) << ", " << p.logical_cpus << " cpus"
+    << (p.cpu_governor.empty() ? "" : ", governor " + p.cpu_governor)
+    << (p.smt_control.empty() ? "" : ", smt " + p.smt_control)
+    << (p.turbo.empty() ? "" : ", turbo " + p.turbo) << "\n"
+    << "[provenance] fastfhir tree " << (p.fastfhir_path.empty() ? "?" : p.fastfhir_path) << " ("
+    << (p.fastfhir_path_source.empty() ? "?" : p.fastfhir_path_source) << ")\n"
     << "[provenance] corpus " << p.corpus_doc_count << " docs, "
     << (p.corpus_bytes < 0 ? 0 : p.corpus_bytes / (1024 * 1024)) << " MB, sha256 "
     << (p.corpus_sha256.empty() ? std::string("?") : p.corpus_sha256.substr(0, 12)) << "\n"

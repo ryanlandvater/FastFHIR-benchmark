@@ -1,0 +1,4 @@
+# Pinned FastFHIR checkouts (scripts/pin_fastfhir.sh) and other fetched
+# sources carry their own BUILD/MODULE files; they are separate Bazel repos,
+# never packages of this workspace.
+.external
