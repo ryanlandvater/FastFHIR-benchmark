@@ -70,30 +70,6 @@ static void warmup_arms(bench::BundleBenchFixture &fixture, int warmup_iteration
 }
 
 // ---------------------------------------------------------------------------
-// Per-arm run helpers — each returns its metrics vector.
-// ---------------------------------------------------------------------------
-static std::vector<bench::MetricEvent> run_fastfhir(bench::BundleBenchFixture &bundle)
-{
-  return bench::run_fastfhir_bundle(bundle).metrics;
-}
-static std::vector<bench::MetricEvent> run_json(bench::BundleBenchFixture &bundle)
-{
-  return bench::run_json_bundle(bundle).metrics;
-}
-#if defined(HAVE_HL7V2)
-static std::vector<bench::MetricEvent> run_hl7v2(bench::BundleBenchFixture &bundle)
-{
-  return bench::run_hl7v2_bundle(bundle).metrics;
-}
-#endif
-#if defined(HAVE_GOOGLE_FHIR)
-static std::vector<bench::MetricEvent> run_google_fhir(bench::BundleBenchFixture &bundle)
-{
-  return bench::run_google_fhir_bundle(bundle).metrics;
-}
-#endif
-
-// ---------------------------------------------------------------------------
 // Cross-arm validation (only when all arms are available)
 // ---------------------------------------------------------------------------
 #if defined(HAVE_GOOGLE_FHIR)

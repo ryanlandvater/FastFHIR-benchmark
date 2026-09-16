@@ -204,12 +204,12 @@ namespace bench
     // Diagnostic only -- a run with this set is not comparable to one without.
     if (std::getenv("BENCH_FF_PREFAULT"))
     {
-      volatile std::uint8_t sink = 0;
+      // The write goes through a volatile lvalue so it cannot be elided.
+      // (Chaining it into another assignment is deprecated in C++20.)
       std::uint8_t *base = const_cast<std::uint8_t *>(payload_memory.base());
       const std::size_t page = 16384;  // Apple silicon
       for (std::size_t off = 0; off < arena_hint; off += page)
-        sink = static_cast<volatile std::uint8_t &>(base[off]) = 0;
-      (void)sink;
+        static_cast<volatile std::uint8_t &>(base[off]) = 0;
     }
 
     std::int64_t trace_user0 = 0, trace_sys0 = 0;

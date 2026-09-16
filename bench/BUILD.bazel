@@ -220,6 +220,7 @@ cc_binary(
 
 cc_test(
     name = "timing_conformance_test",
+    size = "small",
     srcs = ["timing_conformance_test.cpp"],
     data = ["enrich.json"],
     deps = [
@@ -231,6 +232,7 @@ cc_test(
 # decides whether numbers may become an artifact at all (TASKS.md IN-0).
 cc_test(
     name = "provenance_test",
+    size = "small",
     srcs = ["provenance_test.cpp"],
     deps = [":bench_provenance"],
 )

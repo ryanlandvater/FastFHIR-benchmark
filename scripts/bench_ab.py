@@ -57,6 +57,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SIDES = ("candidate", "baseline")
+# 256 MB peaks at ~4.9 GB resident on the harness (measured 2026-09-16); 4 GB
+# would need tens of GB. Raise deliberately, not by accident.
+MAX_TARGET_MB = 4096
 
 
 def log(msg: str) -> None:
@@ -178,7 +181,9 @@ def main() -> int:
     ap.add_argument("--profile", help="FASTFHIR_PRODUCTION_PROFILE for BOTH sides "
                     "(default: each commit's own base preset)")
     ap.add_argument("--out", required=True, type=Path)
-    ap.add_argument("--targets-mb", default="1,2,4,8,16,32,64")
+    # The harness's own default ladder (bench/main.cpp): 256 MB is where
+    # layout differences dominate, so it belongs in every published run.
+    ap.add_argument("--targets-mb", default="1,2,4,8,16,32,64,256")
     ap.add_argument("--replicates", type=int, default=20)
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--warmup-iterations", type=int, default=1)
@@ -195,6 +200,11 @@ def main() -> int:
     if args.quick:
         args.targets_mb, args.replicates, args.runs, args.warmup_iterations = "1,2,4", 3, 2, 0
     targets = [int(t) for t in args.targets_mb.split(",") if t.strip()]
+    # A ladder that lost its commas (e.g. an unquoted YAML default) arrives as
+    # one enormous number; the harness would try to build that bundle and be
+    # killed by the OS a minute later. Refuse it up front instead.
+    if not targets or any(t <= 0 or t > MAX_TARGET_MB for t in targets):
+        die(f"--targets-mb {args.targets_mb!r}: each size must be 1..{MAX_TARGET_MB} MB")
 
     if not (ROOT / "datasets" / "synthea").is_dir():
         die("datasets/synthea is missing -- link the corpus first (README: Corpus location)")

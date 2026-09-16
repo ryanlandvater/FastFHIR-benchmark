@@ -1,3 +1,9 @@
+# Without this, every build:macos / build:linux / build:windows line below is
+# silently ignored -- it was, until 2026-09-16 (the CI log's --announce_rc never
+# listed one). Among the casualties: the macOS deployment target, whose absence
+# made libc++ warn "The selected platform is no longer supported".
+common --enable_platform_specific_config
+
 build --enable_bzlmod=true
 build --cxxopt=-std=c++20
 build:windows --cxxopt=/std:c++20
@@ -6,5 +12,24 @@ build --compilation_mode=opt
 build --announce_rc
 build:macos --cxxopt=-mmacosx-version-min=15.0
 build:macos --conlyopt=-mmacosx-version-min=15.0
+build:macos --macos_minimum_os=15.0
+build:macos --host_macos_minimum_os=15.0
+
+# Other people's warnings stay out of our build log. Codegen is unaffected
+# (-isystem and -Wno-* only). FastFHIR's .cpp files (external/fastfhir~) are
+# deliberately left out of (2) -- their warnings are ours, filed upstream. Its
+# HEADERS are external too, so (1) hides their warnings inside bench/ TUs; the
+# .cpp files that include them still report them.
+# abseil's type_traits.h alone produced 986 of a clean build's 1,004 warnings,
+# burying the handful that were ours.
+#
+# 1. Headers from other Bazel modules are included with -isystem, so their
+#    warnings do not surface when OUR files (bench/, third_party/) include them.
+build --features=external_include_paths
+# 2. Compiling the modules' own sources: silence the specific noise they emit.
+build:macos --per_file_copt=external/(abseil-cpp|protobuf|apple_support)[~+].*@-Wno-deprecated-builtins,-Wno-deprecated-this-capture,-Wno-unused-result
+build:macos --host_per_file_copt=external/(abseil-cpp|protobuf|apple_support)[~+].*@-Wno-deprecated-builtins,-Wno-deprecated-this-capture,-Wno-unused-result
+build:linux --per_file_copt=external/(abseil-cpp|protobuf)[~+].*@-Wno-deprecated-builtins,-Wno-deprecated-this-capture
+build:linux --host_per_file_copt=external/(abseil-cpp|protobuf)[~+].*@-Wno-deprecated-builtins,-Wno-deprecated-this-capture
 run --enable_bzlmod=true
 test --enable_bzlmod=true
