@@ -99,11 +99,13 @@ jobs:
       - name: A/B timing (interleaved)
         run: |
           set -uo pipefail
+          # ${quick[@]+...}: macOS /bin/bash is 3.2, where an EMPTY array is
+          # "unbound" under set -u -- so a full run (no --quick) would die here.
           quick=(); [[ "$QUICK" == "true" ]] && quick=(--quick)
           rc=0
           .venv/bin/python scripts/bench_ab.py \
             --candidate "$FASTFHIR_REF" --baseline "$BASELINE_REF" \
-            --targets-mb "$TARGETS_MB" --out "$RESULTS" "${quick[@]}" || rc=$?
+            --targets-mb "$TARGETS_MB" --out "$RESULTS" ${quick[@]+"${quick[@]}"} || rc=$?
           # 2 = cross-arm parity mismatch: the run is complete but the gate
           # will refuse it. Anything else is a failure of the run itself.
           if [[ "$rc" -eq 2 ]]; then
@@ -121,7 +123,7 @@ jobs:
           # the timing step resolved it.
           FIGURE_FORMAT=both PYTHON=.venv/bin/python \
             scripts/run_benchmark.sh --fastfhir-ref "$sha" --skip-timing \
-            --results-dir "$RESULTS/candidate" "${quick[@]}"
+            --results-dir "$RESULTS/candidate" ${quick[@]+"${quick[@]}"}
           if [[ -f results/recovery_curve.csv ]]; then
             cp results/recovery_curve.csv "$RESULTS/candidate/"
           fi
