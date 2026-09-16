@@ -151,6 +151,22 @@ Consequences:
 
 Newest first. One line per change, with what it did and did not settle.
 
+- **2026-09-16 (evening)** — **PA-10a/b: Bundle written last; enrich storage cost measured.**
+  - What changed: the FastFHIR arm now writes resources first and the
+    Bundle + entry array last (`BENCH_FF_BUNDLE=backfill` keeps the old
+    layout). Test 4 reports `bytes_written` / `bytes_overwritten`, and fig4
+    shows both.
+  - At 16 MB, FastFHIR writes 243 KB (5% of the stream) and overwrites 98 B.
+    JSON and Google FHIR rewrite 100% of the stream. HL7v2 appends 2.7 KB and
+    overwrites nothing.
+  - **Found:** FastFHIR already rewinds its write head when reopening a sealed
+    stream (onto the checksum block). APPEND-1's rollback generalizes a
+    primitive that exists, rather than adding a new one.
+  - **Not settled:**
+    - FastFHIR's appended bytes still grow with N until APPEND-1 (PA-10c).
+    - The HL7v2 timer includes a full-stream copy (PA-10d).
+    - The A/B needs a new baseline.
+
 - **2026-09-16 (later)** — **PB-2a–c: workflow, same-box A/B, publish gate.**
   - What changed: `bench-release.yml` runs interleaved A/B timing
     (`scripts/bench_ab.py`), then the candidate's artifacts, sweep and figures,
@@ -553,6 +569,73 @@ cross-arm parity mismatch, not a crash.
       unvalidated (works only on absent slots). Filed upstream as **CAPI-12**.
       Until it lands, the FF arm MUST re-serialize the bundle root — the delta
       is O(entry-array), and the claim waits on CAPI-12 + IN-D.
+      - **Measured 2026-09-16** (full run 35126898251, median): FastFHIR appends
+        18 KB at 1 MB and **2.34 MB at 256 MB**. The other arms add a constant
+        1.6–2.7 KB.
+        - Cause: `Bundle.entry` is an inline array of **84-byte**
+          `FF_BUNDLE_ENTRY` blocks, and Test 1 preallocates it at the **front**
+          (`[Bundle | entry[N] | resources…]`). The enrich therefore writes a new
+          Bundle block and a new N+1 array: 412 entries × 84 B + Observation +
+          Bundle = the 39.8 KB measured at 4 MB.
+        - `fig4`'s "bytes added" is misleading in both directions. JSON and
+          Google re-serialize the whole stream and HL7v2 copies it, while
+          FastFHIR overwrites nothing.
+      - **Direction (Ryan, 2026-09-16): tail-rewrite append**, filed upstream
+        as **APPEND-1**.
+        - Resources are written first. `Bundle.entry` is written last by
+          `serialize_bundle_array(std::vector<BundleentryData>)`.
+        - The enrich reads the light entry vector, rolls the write head back to
+          the array, appends the resource there, rewrites the N+1 array after
+          it, and reseals.
+        - Growth = resource + 84 B, with nothing orphaned.
+      - Benchmark follow-ups:
+        - [x] **PA-10a. Build the Bundle last** (Test 1, FastFHIR arm). ✅ 2026-09-16
+              - Workers record each child's `(offset, type)` into their own slot
+                of the in-memory `bundle.entry`. One `append_obj(bundle)` runs
+                after the join.
+              - The old layout stays available as `BENCH_FF_BUNDLE=backfill`, and
+                the run banner prints which layout ran.
+              - Verified with `BENCH_VALIDATE` for both layouts: the stream
+                validates, entry counts match, and the sealed size is identical.
+                The root sits at 720,795 of 750,519 B (tail) vs 54 (backfill).
+              - Timing is unchanged within noise (FF arm, 6 replicates × 3 runs):
+                the fastest Test 1 run is 0.399 vs 0.398 ms at 16 MB and 1.335 vs
+                1.370 ms at 64 MB. Test 2 and Test 4 are also unchanged.
+              - The binary changes, so the A/B baseline still needs a re-run.
+        - [x] **PA-10b. Report bytes written and bytes overwritten** (Test 4). ✅ 2026-09-16
+              - New CSV columns `bytes_written` and `bytes_overwritten`, appended
+                at the end (-1 = not applicable). They are filled per arm from a
+                stored-stream update model:
+                - JSON and Google FHIR: written = the whole enriched stream,
+                  overwritten = the whole source.
+                - HL7v2: written = the message, overwritten = 0.
+                - FastFHIR: written = growth + 98, overwritten = **98**.
+              - **FastFHIR's 98 B, found by measuring rather than assuming:**
+                opening a Builder on a sealed stream already rewinds the write
+                head onto the old checksum block (FastFHIR
+                `src/FF_Builder.cpp`, "Re-open for append",
+                `m_memory.reset(...)`). The Observation overwrites that 44 B
+                block, and the reseal restamps the 54 B header.
+              - `BENCH_VALIDATE` snapshots the source and asserts that every
+                changed byte lies in those two regions. Verified at 1, 4 and
+                16 MB, both layouts.
+              - `fig4` is now two panels on a shared arm axis (bytes written /
+                existing bytes overwritten, with each value's share of the
+                stream). Zero is labelled "append-only", since a log axis cannot
+                draw it.
+              - Pre-PA-10b CSVs fall back to the old growth chart, with a
+                caveat. `summary.md` gains a storage-cost table for Test 4.
+              - Not done: the PG schema (`benchmark_results`) has no columns for
+                these yet.
+              - Also moved each arm's `timer.stop_ns()` ahead of its size reads
+                (nothing between the last real operation and the stop).
+        - [ ] **PA-10d. The HL7v2 enrich copies the whole stream inside its
+              timer** (`enriched_stream = payload`). Its storage model is an
+              append, so its duration includes a memcpy of the source (1.7 ms at
+              256 MB) that an append-to-file would not pay. Either append to a
+              buffer the arm owns, or report the copy separately.
+        - [ ] **PA-10c.** Test 4 (FF arm): switch to the APPEND-1 sequence once
+              upstream ships it.
 - [ ] **PA-8. Cross-arm validation must cover every arm.**
       [`bench/main.cpp:95`](bench/main.cpp:95) compares FastFHIR↔JSON and
       JSON↔HL7v2 only. Nothing has ever checked the Google arm, which is how a

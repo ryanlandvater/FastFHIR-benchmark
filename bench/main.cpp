@@ -312,6 +312,13 @@ int main(int argc, char **argv)
             << "\n  hardware_concurrency=" << std::thread::hardware_concurrency()
             << ", performance cores=" << FastFHIR::performance_core_count()
             << " (the pool default)";
+  {
+    const char *layout = std::getenv("BENCH_FF_BUNDLE");
+    std::cerr << "\n  fastfhir Bundle layout: "
+              << (layout && std::string_view(layout) == "backfill"
+                      ? "backfill (BENCH_FF_BUNDLE) -- entry array first, workers patch it"
+                      : "tail -- resources first, Bundle + entry array written last (PA-10a)");
+  }
   if (const char *t = std::getenv("BENCH_FF_THREADS"))
     std::cerr << ", BENCH_FF_THREADS=" << t;
   std::cerr << "\n\n";
@@ -469,8 +476,10 @@ int main(int argc, char **argv)
   }
   std::cerr << "\n";
 
+  // New columns go on the END: every consumer reads by name, and appending
+  // keeps positional readers of the old prefix working.
   std::cout << "arm,test,duration_ns,ops,bytes_in,bytes_out,target_mb,patients_in_bundle,cpu_ns,"
-               "replicate,run\n"
+               "replicate,run,bytes_written,bytes_overwritten\n"
             << std::flush;
 
   // -----------------------------------------------------------------------
@@ -626,7 +635,8 @@ int main(int argc, char **argv)
     std::cout << m.arm << "," << bench::to_string(m.stage) << "," << m.duration_ns
               << "," << m.ops << "," << m.bytes_in << "," << m.bytes_out
               << "," << target_mb << "," << n_patients << "," << m.cpu_ns
-              << "," << replicate << "," << run_index << "\n"
+              << "," << replicate << "," << run_index
+              << "," << m.bytes_written << "," << m.bytes_overwritten << "\n"
               << std::flush;
   };
 

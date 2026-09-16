@@ -40,6 +40,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.transforms as transforms
 import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
@@ -113,6 +114,15 @@ CAVEAT_RA_GRANULARITY = (
 CAVEAT_ENRICH = (
     "Not the same operation in every arm (PA-9): FastFHIR::Memory is a shared_ptr handle, so the "
     "FastFHIR arm appends in place while the others build a separate buffer."
+)
+CAVEAT_ENRICH_MODEL = (
+    "Storage model (PA-10b): a stored stream brought to its enriched state. JSON and Google FHIR "
+    "re-serialize the whole stream; HL7v2 appends one message; FastFHIR appends and rewrites only its "
+    "54 B header and its old 44 B checksum block (verified byte for byte under BENCH_VALIDATE)."
+)
+CAVEAT_ENRICH_ARRAY = (
+    "PA-10: FastFHIR's appended bytes still include a whole new (N+1) x 84 B Bundle.entry array, "
+    "so they grow with the bundle; upstream APPEND-1 rewrites the tail array instead (PA-10c)."
 )
 
 
@@ -647,11 +657,71 @@ def fig_wire_size(df: pd.DataFrame, prov: Provenance, out: Path, exts: list[str]
 
 
 def fig_enrich_delta(df: pd.DataFrame, prov: Provenance, out: Path, exts: list[str]) -> None:
-    """Bytes added by appending one Observation — the WF-4.1 claim, measured.
+    """What storing one appended Observation costs: bytes written, and how many
+    of them land on bytes the stream already had (PA-10b).
 
-    A bar chart because the story is a comparison of four magnitudes at one
-    corpus size, not a trend.
+    Two panels on one shared arm axis rather than one chart with two scales:
+    both are bytes, but "overwritten" is zero for an append-only format, which
+    a log axis cannot draw -- so that case is labelled, not plotted.
     """
+    t4 = df[df["test"] == "test_4_enrich"].copy()
+    has_model = {"bytes_written", "bytes_overwritten"} <= set(t4.columns) and \
+        (t4.get("bytes_written", pd.Series(dtype=float)) >= 0).any()
+    if not has_model:
+        fig_enrich_delta_legacy(df, prov, out, exts)
+        return
+    t4 = t4[t4["bytes_written"] >= 0]
+    target = sorted(t4["target_mb"].unique())[-1]
+    sub = t4[t4["target_mb"] == target]
+    arms = [a for a in ordered_arms(df) if a in set(sub["arm"])]
+    written = [sub[sub["arm"] == a]["bytes_written"].median() for a in arms]
+    overwritten = [sub[sub["arm"] == a]["bytes_overwritten"].median() for a in arms]
+    source = [sub[sub["arm"] == a]["bytes_in"].median() for a in arms]
+
+    fig, axes = plt.subplots(1, 2, figsize=(10.4, 4.6), sharey=True)
+    fig.suptitle(f"Storing one appended Observation ({target} MB target bundle)",
+                 fontsize=12, y=0.985, x=0.008, ha="left", color=TEXT_PRIMARY)
+    ypos = np.arange(len(arms))
+    panels = [
+        (axes[0], written, "Bytes written"),
+        (axes[1], overwritten, "Existing bytes overwritten"),
+    ]
+    for ax, values, title in panels:
+        ax.set_title(title, fontsize=10, loc="left", color=TEXT_PRIMARY)
+        drawn = [v if v > 0 else np.nan for v in values]
+        ax.barh(ypos, drawn, height=0.45, color=[arm_color(a) for a in arms],
+                edgecolor=SURFACE, linewidth=2)  # 2px surface gap, not a border
+        ax.set_xscale("log")
+        ax.set_xlabel("bytes (log scale)")
+        ax.grid(axis="y", visible=False)
+        for spine in ("top", "right", "left"):
+            ax.spines[spine].set_visible(False)
+        # Zero-valued rows are labelled at the axis's left edge, in axes x /
+        # data y, so the label sits where a bar would start.
+        edge = transforms.blended_transform_factory(ax.transAxes, ax.transData)
+        for y, v, src in zip(ypos, values, source):
+            if v > 0:
+                share = f"  ({v / src:.0%} of stream)" if src > 0 and v / src >= 0.005 else ""
+                ax.annotate(fmt_bytes(v) + share, xy=(v, y), xytext=(6, 0),
+                            textcoords="offset points", va="center", fontsize=8,
+                            color=TEXT_SECONDARY)
+            else:
+                # Nothing to draw on a log axis: say so at the axis floor.
+                ax.annotate("0 (append-only)", xy=(0, y), xycoords=edge, xytext=(4, 0),
+                            textcoords="offset points", va="center", ha="left",
+                            fontsize=8, color=TEXT_SECONDARY)
+        ax.margins(x=0.35)
+    axes[0].set_yticks(ypos, [arm_label(a) for a in arms])
+    axes[0].invert_yaxis()
+
+    fig.tight_layout(rect=[0, 0.17, 1, 0.95])
+    finish(fig, prov, [CAVEAT_ENRICH_MODEL, CAVEAT_ENRICH_ARRAY, CAVEAT_ENRICH])
+    save(fig, out / "fig4_enrich_delta", exts)
+
+
+def fig_enrich_delta_legacy(df: pd.DataFrame, prov: Provenance, out: Path, exts: list[str]) -> None:
+    """Pre-PA-10b CSVs have no bytes_written/bytes_overwritten: plot the old
+    output-minus-input delta, and say what it hides."""
     t4 = df[(df["test"] == "test_4_enrich") & (df["bytes_out"] > 0)].copy()
     if t4.empty:
         print("  skip fig4: no test_4_enrich rows with bytes")
@@ -663,7 +733,7 @@ def fig_enrich_delta(df: pd.DataFrame, prov: Provenance, out: Path, exts: list[s
     deltas = [sub[sub["arm"] == a]["delta"].median() for a in arms]
 
     fig, ax = plt.subplots(figsize=(8.4, 4.4))
-    fig.suptitle(f"Bytes added by appending one Observation ({target} MB target bundle)",
+    fig.suptitle(f"Stream growth from appending one Observation ({target} MB target bundle)",
                  fontsize=12, y=0.985, x=0.008, ha="left", color=TEXT_PRIMARY)
     ypos = np.arange(len(arms))
     ax.barh(ypos, deltas, height=0.45, color=[arm_color(a) for a in arms],
@@ -683,9 +753,10 @@ def fig_enrich_delta(df: pd.DataFrame, prov: Provenance, out: Path, exts: list[s
 
     fig.tight_layout(rect=[0, 0.15, 1, 0.95])
     finish(fig, prov, [
+        "Legacy CSV (no bytes_written/bytes_overwritten): growth hides that JSON and Google FHIR "
+        "rewrite the whole stream while FastFHIR appends (PA-10b).",
+        CAVEAT_ENRICH_ARRAY,
         CAVEAT_ENRICH,
-        "PA-10: the FastFHIR arm appends a whole new root Bundle block, not just the observation — "
-        "the opposite of the 'append without touching any other byte' claim (WF-4.1) it should demonstrate.",
     ])
     save(fig, out / "fig4_enrich_delta", exts)
 
@@ -1178,6 +1249,13 @@ def fig_provenance_card(prov: Provenance, out: Path, exts: list[str]) -> None:
 
 
 def write_tables(df: pd.DataFrame, prov: Provenance, out: Path) -> None:
+    extra = {}
+    has_write_model = {"bytes_written", "bytes_overwritten"} <= set(df.columns)
+    if has_write_model:
+        # -1 = not applicable; keep it out of the median.
+        extra = dict(
+            median_bytes_written=("bytes_written", lambda s: s[s >= 0].median()),
+            median_bytes_overwritten=("bytes_overwritten", lambda s: s[s >= 0].median()))
     agg = (
         df.groupby(["test", "arm"])
         .agg(runs=("duration_ns", "size"),
@@ -1185,7 +1263,8 @@ def write_tables(df: pd.DataFrame, prov: Provenance, out: Path) -> None:
              p90_us=("duration_ns", lambda s: s.quantile(0.9) / 1000.0),
              median_ops=("ops", "median"),
              median_bytes_in=("bytes_in", "median"),
-             median_bytes_out=("bytes_out", "median"))
+             median_bytes_out=("bytes_out", "median"),
+             **extra)
         .round(2)
         .reset_index()
     )
@@ -1201,7 +1280,8 @@ def write_tables(df: pd.DataFrame, prov: Provenance, out: Path) -> None:
         lines += [f"- {r}" for r in prov.why_not_artifact] + [""]
     lines += [f"`{prov.stamp()}`", "", "## Caveats carried on every figure", ""]
     lines += [f"- {c}" for c in (CAVEAT_PARITY, CAVEAT_CHOICE, CAVEAT_RA_GRANULARITY,
-                                 CAVEAT_QUERY, CAVEAT_SELECTIVE, CAVEAT_ENRICH)]
+                                 CAVEAT_QUERY, CAVEAT_SELECTIVE, CAVEAT_ENRICH,
+                                 CAVEAT_ENRICH_MODEL, CAVEAT_ENRICH_ARRAY)]
     lines += ["", "## Medians by stage and arm", ""]
     for stage, title in STAGES:
         sub = agg[agg["test"] == stage]
@@ -1223,6 +1303,18 @@ def write_tables(df: pd.DataFrame, prov: Provenance, out: Path) -> None:
                 f"| {int(r['median_bytes_out']):,} |"
             )
         lines.append("")
+        if stage == "test_4_enrich" and has_write_model:
+            lines += ["Storage cost of the update (PA-10b):", "",
+                      "| Arm | median bytes written | median existing bytes overwritten |",
+                      "|---|---:|---:|"]
+            for arm in ordered_arms(df):
+                row = sub[sub["arm"] == arm]
+                if row.empty or pd.isna(row.iloc[0]["median_bytes_written"]):
+                    continue
+                r = row.iloc[0]
+                lines.append(f"| {arm_label(arm)} | {int(r['median_bytes_written']):,} "
+                             f"| {int(r['median_bytes_overwritten']):,} |")
+            lines.append("")
     (out / "summary.md").write_text("\n".join(lines))
 
 
@@ -1288,6 +1380,10 @@ def coerce(df: pd.DataFrame, source: str) -> pd.DataFrame:
             df[col] = 0
     for col in ("duration_ns", "ops", "bytes_in", "bytes_out", "target_mb", "patients_in_bundle"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    # PA-10b columns; absent from older CSVs, where fig4 falls back to growth.
+    for col in ("bytes_written", "bytes_overwritten"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     return df.dropna(subset=["duration_ns"]).reset_index(drop=True)
 
 

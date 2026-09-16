@@ -71,6 +71,10 @@ struct EnrichMetricsSummary {
   std::size_t enriched_bytes = 0;
   std::size_t appended_observations = 0;
   std::int64_t duration_ns = 0;
+  // See MetricEvent::bytes_written / bytes_overwritten. Set per arm from what
+  // its update model does to a STORED stream, not from buffer sizes alone.
+  std::int64_t bytes_written = -1;
+  std::int64_t bytes_overwritten = -1;
 };
 
 template <typename StreamT>
@@ -83,18 +87,24 @@ inline std::string format_enrich_summary(const EnrichMetricsSummary& summary) {
   return "source_bytes=" + std::to_string(summary.source_bytes) +
          " enriched_bytes=" + std::to_string(summary.enriched_bytes) +
          " appended_observations=" + std::to_string(summary.appended_observations) +
+         " bytes_written=" + std::to_string(summary.bytes_written) +
+         " bytes_overwritten=" + std::to_string(summary.bytes_overwritten) +
          " duration_ns=" + std::to_string(summary.duration_ns);
 }
 
 // EnrichMetricsSummary has carried source_bytes/enriched_bytes since the port
 // and nothing ever read them -- they were formatted into a debug string and
 // dropped. This overload is what puts them in the results (TASKS.md IN-0).
-inline MetricEvent enrich_metric(std::string_view arm, const EnrichMetricsSummary& summary) {
-  return MetricEvent{std::string(arm), Stage::Test4Enrich, summary.duration_ns,
-                     static_cast<std::int64_t>(summary.source_bytes),
-                     static_cast<std::int64_t>(summary.enriched_bytes),
-                     /*ops=*/0,
-                     /*entries=*/static_cast<std::int64_t>(summary.appended_observations)};
+inline MetricEvent enrich_metric(std::string_view arm, const EnrichMetricsSummary& summary,
+                                 Stage stage = Stage::Test4Enrich) {
+  MetricEvent m{std::string(arm), stage, summary.duration_ns,
+                static_cast<std::int64_t>(summary.source_bytes),
+                static_cast<std::int64_t>(summary.enriched_bytes),
+                /*ops=*/0,
+                /*entries=*/static_cast<std::int64_t>(summary.appended_observations)};
+  m.bytes_written = summary.bytes_written;
+  m.bytes_overwritten = summary.bytes_overwritten;
+  return m;
 }
 
 inline MetricEvent enrich_metric(std::string_view arm, std::int64_t duration_ns) {
@@ -144,11 +154,25 @@ inline EnrichResult<StreamType> enrich_fastfhir(const StreamType& payload,
   auto new_root = builder.append_obj(bundle);
   (void)seal_stream(builder_handle, new_root, "fastfhir arm enrich");
 
+  const std::int64_t duration_ns = timer.stop_ns();
+
   EnrichMetricsSummary summary;
   summary.source_bytes = source_bytes_before;
   summary.enriched_bytes = enriched_stream.view().size();
   summary.appended_observations = 1;
-  summary.duration_ns = timer.stop_ns();
+  summary.duration_ns = duration_ns;
+  // Append-only past two fixed regions. Opening a Builder on a sealed stream
+  // rewinds the write head onto the old checksum block (FastFHIR
+  // src/FF_Builder.cpp, "Re-open for append"), so the observation overwrites
+  // it; the reseal then stamps the stream header whole. Everything else lands
+  // past the old end. Until APPEND-1, that appended part still carries a fresh
+  // (N+1) x 84 B entry array (PA-10). BENCH_VALIDATE checks this byte for byte.
+  summary.bytes_overwritten =
+      static_cast<std::int64_t>(FF_HEADER::HEADER_SIZE) +
+      static_cast<std::int64_t>(FF_CHECKSUM::HEADER_SIZE);
+  summary.bytes_written =
+      static_cast<std::int64_t>(summary.enriched_bytes - summary.source_bytes) +
+      summary.bytes_overwritten;
   return EnrichResult<StreamType>{std::move(enriched_stream), summary};
 }
 
@@ -171,12 +195,17 @@ inline EnrichResult<StreamType> enrich_json(const StreamType& payload,
   bundle["entry"].push_back(nlohmann::json{{"resource", std::move(observation)}});
 
   StreamType enriched_stream = bundle.dump();
+  const std::int64_t duration_ns = timer.stop_ns();
 
   EnrichMetricsSummary summary;
   summary.source_bytes = payload.size();
   summary.enriched_bytes = enriched_stream.size();
   summary.appended_observations = 1;
-  summary.duration_ns = timer.stop_ns();
+  summary.duration_ns = duration_ns;
+  // A JSON document has no append point inside it: the stored file is
+  // replaced by the new serialization, so every existing byte is rewritten.
+  summary.bytes_written = static_cast<std::int64_t>(summary.enriched_bytes);
+  summary.bytes_overwritten = static_cast<std::int64_t>(summary.source_bytes);
   return EnrichResult<StreamType>{std::move(enriched_stream), summary};
 }
 
@@ -194,12 +223,18 @@ inline EnrichResult<StreamType> enrich_hl7v2(const StreamType& payload,
 
   StreamType enriched_stream = payload;
   enriched_stream += message.dump();
+  const std::int64_t duration_ns = timer.stop_ns();
 
   EnrichMetricsSummary summary;
   summary.source_bytes = payload.size();
   summary.enriched_bytes = enriched_stream.size();
   summary.appended_observations = 1;
-  summary.duration_ns = timer.stop_ns();
+  summary.duration_ns = duration_ns;
+  // A v2 batch is a message sequence: the new ORU^R01 appends to the stored
+  // file and nothing before it changes. (The in-memory copy above is a
+  // benchmark artifact inside the timer -- PA-10d.)
+  summary.bytes_written = static_cast<std::int64_t>(summary.enriched_bytes - summary.source_bytes);
+  summary.bytes_overwritten = 0;
   return EnrichResult<StreamType>{std::move(enriched_stream), summary};
 }
 
@@ -330,11 +365,17 @@ inline EnrichResult<StreamType> enrich_google_fhir(const StreamType& payload,
     append_record(enriched_stream, record_type, record_bytes);
   }
 
+  const std::int64_t duration_ns = timer.stop_ns();
+
   EnrichMetricsSummary summary;
   summary.source_bytes = payload.size();
   summary.enriched_bytes = enriched_stream.size();
   summary.appended_observations = 1;
-  summary.duration_ns = timer.stop_ns();
+  summary.duration_ns = duration_ns;
+  // This arm re-serializes every record into a new stream (above), so the
+  // stored stream is replaced whole, exactly as JSON's is.
+  summary.bytes_written = static_cast<std::int64_t>(summary.enriched_bytes);
+  summary.bytes_overwritten = static_cast<std::int64_t>(summary.source_bytes);
   return EnrichResult<StreamType>{std::move(enriched_stream), summary};
 }
 

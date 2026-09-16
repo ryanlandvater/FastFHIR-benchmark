@@ -122,6 +122,18 @@ struct MetricEvent {
   //
   // -1 means the stage did not sample it.
   std::int64_t cpu_ns = -1;
+
+  // Storage cost of a MUTATION (Test 4, PA-10b), modelled as updating a stored
+  // stream to its enriched state:
+  //   bytes_written      every byte the update puts on storage, new or rewritten
+  //   bytes_overwritten  the subset of those that land on bytes the stream
+  //                      already had (0 = append-only)
+  // bytes_out - bytes_in, the old "bytes added", hid the difference: a format
+  // that re-serializes the whole stream and one that appends both add ~2 KB.
+  //
+  // -1 means not applicable to this stage.
+  std::int64_t bytes_written = -1;
+  std::int64_t bytes_overwritten = -1;
 };
 
 struct ArmRunResult {

@@ -40,12 +40,21 @@ namespace bench
       return fixture.observation;
     }
 
-    // Parallel Bundle construction, in the shape the engine actually uses
-    // (src/FF_Ingestor.cpp step 5): pre-allocate the Bundle's inline entry
-    // array, hand every worker a FIFO::Queue consumer, and have each worker
-    // append its resource and then amend the parent slot with the finished
-    // child's offset. No worker allocates the array and no two workers touch
-    // the same slot, so the only shared mutable state is the arena write head.
+    // Parallel Bundle construction. Every worker gets a FIFO::Queue consumer and
+    // appends resources; the only shared mutable state is the arena write head.
+    // Where the Bundle and its entry array go is the layout choice (PA-10a):
+    //
+    //   tail (default)  workers record each child's (offset, type) into its own
+    //                   slot of the IN-MEMORY BundleData::entry, and the Bundle
+    //                   is serialized once, after they finish:
+    //                     [resource_1 ... resource_N | Bundle | entry[N]]
+    //                   The mutable, growing structure sits at the end of the
+    //                   stream, where an enrich can rewrite it (upstream
+    //                   APPEND-1) instead of orphaning it.
+    //   backfill        BENCH_FF_BUNDLE=backfill. The ingestor's shape
+    //                   (src/FF_Ingestor.cpp step 2): pre-allocate the inline
+    //                   entry array FIRST and have each worker amend its slot:
+    //                     [Bundle | entry[N] | resource_1 ... resource_N]
     //
     // The previous dispatch_apply form is gone. It measured the same thing but
     // could not vary the worker count, which is the axis this arm exists to
@@ -131,17 +140,41 @@ namespace bench
       return n;
     }
 
-    // Append one resource and amend the parent entry slot with its offset.
-    // Shared by the serial and parallel paths so they write identical bytes.
+    // Where a finished child's (offset, type) goes. Exactly one member is set.
+    struct FfEntrySink
+    {
+      // tail: the in-memory entry vector, sized up front. Each worker writes
+      // only its own index, so no element is shared and nothing reallocates.
+      std::vector<BundleentryData> *entries = nullptr;
+      // backfill: the pre-allocated inline array already in the arena.
+      FastFHIR::Reflective::ObjectHandle *entry_array = nullptr;
+    };
+
+    inline bool ff_backfill_layout()
+    {
+      static const bool backfill = [] {
+        const char *env = std::getenv("BENCH_FF_BUNDLE");
+        return env && std::string_view(env) == "backfill";
+      }();
+      return backfill;
+    }
+
+    // Append one resource and record where it went. Shared by the serial and
+    // parallel paths so they write identical bytes.
     inline void ff_build_one(FastFHIR::Builder &builder,
-                             FastFHIR::Reflective::ObjectHandle &entry_array,
+                             const FfEntrySink &sink,
                              const FfBuildItem &item,
                              std::uint32_t idx)
     {
       FastFHIR::Reflective::ObjectHandle child =
           item.patient ? builder.append_obj(*item.patient)
                        : builder.append_obj(*item.observation);
-      FastFHIR::Reflective::MutableEntry slot = entry_array[idx];
+      if (sink.entries)
+      {
+        (*sink.entries)[idx].resource = static_cast<ResourceReference>(child);
+        return;
+      }
+      FastFHIR::Reflective::MutableEntry slot = (*sink.entry_array)[idx];
       FastFHIR::Reflective::MutableEntry resource_slot =
           slot[FastFHIR::Fields::BUNDLE_ENTRY::RESOURCE];
       resource_slot = child;
@@ -229,24 +262,35 @@ namespace bench
       for (const auto &observation : item.observations)
         items.push_back(FfBuildItem{nullptr, &observation});
 
-    // Pre-allocate the inline entry array (FF_Ingestor.cpp step 2): N
-    // default-constructed BundleentryData means append_obj lays down
-    // [FF_ARRAY header | entry[0] | entry[1] | ...] as one contiguous region,
-    // and every worker below patches inside its own already-allocated slot.
+    // N default-constructed entries either way. backfill serializes them now,
+    // as one contiguous [FF_ARRAY header | entry[0] | ...] region the workers
+    // patch in place; tail keeps them in memory for the workers to fill and
+    // serializes the finished Bundle after the join.
     BundleData bundle{};
     bundle.type = FF_BundleType::Collection;
     bundle.entry = std::vector<BundleentryData>(items.size());
 
-    FastFHIR::Reflective::ObjectHandle root_handle = builder.append_obj(bundle);
-    FastFHIR::Reflective::ObjectHandle entry_array =
-        root_handle[FastFHIR::Fields::BUNDLE::ENTRY];
+    const bool backfill = ff_backfill_layout();
+    FastFHIR::Reflective::ObjectHandle root_handle;
+    FastFHIR::Reflective::ObjectHandle entry_array;
+    FfEntrySink sink;
+    if (backfill)
+    {
+      root_handle = builder.append_obj(bundle);
+      entry_array = root_handle[FastFHIR::Fields::BUNDLE::ENTRY];
+      sink.entry_array = &entry_array;
+    }
+    else
+    {
+      sink.entries = &bundle.entry;
+    }
 
     const unsigned int worker_count = bench::g_serial_build ? 1u : ff_worker_threads();
 
     if (worker_count <= 1)
     {
       for (std::uint32_t idx = 0; idx < items.size(); ++idx)
-        ff_build_one(builder, entry_array, items[idx], idx);
+        ff_build_one(builder, sink, items[idx], idx);
     }
     else if (const char *mode = std::getenv("BENCH_FF_MODE");
              mode && std::string_view(mode) == "split")
@@ -263,10 +307,10 @@ namespace bench
       {
         const std::size_t begin = (n * w) / worker_count;
         const std::size_t end = (n * (w + 1)) / worker_count;
-        workers.emplace_back([&builder, &entry_array, &items, begin, end]()
+        workers.emplace_back([&builder, &sink, &items, begin, end]()
                              {
           for (std::size_t idx = begin; idx < end; ++idx)
-            ff_build_one(builder, entry_array, items[idx], static_cast<std::uint32_t>(idx)); });
+            ff_build_one(builder, sink, items[idx], static_cast<std::uint32_t>(idx)); });
       }
       for (auto &worker : workers)
         worker.join();
@@ -291,7 +335,7 @@ namespace bench
       workers.reserve(worker_count);
       for (unsigned int i = 0; i < worker_count; ++i)
       {
-        workers.emplace_back([&builder, &entry_array, &items, &status, &waiters, &faulted,
+        workers.emplace_back([&builder, &sink, &items, &status, &waiters, &faulted,
                               consumer = std::move(consumers[i])]() mutable
                              {
           FfBuildTask task;
@@ -303,7 +347,7 @@ namespace bench
               try
               {
                 for (std::uint32_t idx = task.begin; idx < task.end; ++idx)
-                  ff_build_one(builder, entry_array, items[idx], idx);
+                  ff_build_one(builder, sink, items[idx], idx);
               }
               catch (...)
               {
@@ -339,10 +383,14 @@ namespace bench
         throw std::runtime_error("fastfhir arm: concurrent bundle build faulted");
     }
 
-    // The sealed Bundle's own entry count, like the JSON arm's. The Bundle was
-    // appended before the workers ran, so root_handle IS the root -- appending
-    // it a second time here would write a whole duplicate Bundle whose entry
+    // tail: the Bundle goes down now, last, with every entry already filled.
+    // backfill: it went down before the workers ran, so root_handle IS the
+    // root -- appending it again would write a duplicate Bundle whose entry
     // slots are the unpatched originals.
+    if (!backfill)
+      root_handle = builder.append_obj(bundle);
+
+    // The sealed Bundle's own entry count, like the JSON arm's.
     const std::int64_t test1_entries = static_cast<std::int64_t>(bundle.entry.size());
     (void)seal_stream(builder_handle, root_handle, "fastfhir arm bundle");
     const std::int64_t test1_ns = test1_timer.stop_ns();
@@ -558,7 +606,61 @@ namespace bench
     }
   }
 
+  // BENCH_VALIDATE: check bytes_overwritten against the bytes, not the model.
+  // Snapshot the sealed source, enrich, and report every source byte that
+  // changed. Outside every timed window.
+  std::string pre_enrich;
+  if (std::getenv("BENCH_VALIDATE"))
+  {
+    const auto v = payload_memory.view();
+    pre_enrich.assign(v.data(), v.size());
+    std::fprintf(stderr, "[validate] root at offset %llu of %zu bytes (%s layout)\n",
+                 static_cast<unsigned long long>(root_handle.offset()), v.size(),
+                 ff_backfill_layout() ? "backfill" : "tail");
+  }
+
   auto enrich_result = test_4::BENCH_TEST_4_ENRICH_FN(payload_memory, enrichment_observation_fixture());
+    if (!pre_enrich.empty())
+    {
+      const auto v = payload_memory.view();
+      std::size_t changed = 0, last = 0;
+      std::string ranges;
+      std::size_t run_start = 0;
+      bool in_run = false;
+      const std::size_t n = std::min(pre_enrich.size(), static_cast<std::size_t>(v.size()));
+      for (std::size_t i = 0; i <= n; ++i)
+      {
+        const bool diff = i < n && pre_enrich[i] != static_cast<char>(v.data()[i]);
+        if (diff)
+        {
+          ++changed;
+          last = i;
+          if (!in_run) { run_start = i; in_run = true; }
+        }
+        else if (in_run)
+        {
+          ranges += " [" + std::to_string(run_start) + "," + std::to_string(i) + ")";
+          in_run = false;
+        }
+      }
+      std::fprintf(stderr, "[validate] changed ranges:%s\n", ranges.c_str());
+      // Every changed byte must sit inside the two regions the model counts:
+      // the stream header, or the old checksum block at the source's tail.
+      const std::size_t header_end = static_cast<std::size_t>(FF_HEADER::HEADER_SIZE);
+      const std::size_t footer_begin =
+          pre_enrich.size() - static_cast<std::size_t>(FF_CHECKSUM::HEADER_SIZE);
+      bool within_model = true;
+      for (std::size_t i = 0; i < n; ++i)
+        if (pre_enrich[i] != static_cast<char>(v.data()[i]) && i >= header_end && i < footer_begin)
+          within_model = false;
+      std::fprintf(stderr,
+                   "[validate] enrich changed %zu of %zu source bytes (last at %zu); "
+                   "reported bytes_overwritten=%lld -- %s\n",
+                   changed, pre_enrich.size(), last,
+                   static_cast<long long>(enrich_result.summary.bytes_overwritten),
+                   within_model ? "all inside header + old checksum block"
+                                : "MISMATCH: bytes changed outside the modelled regions");
+    }
     out.metrics.push_back(test_4::enrich_metric("fastfhir", enrich_result.summary));
     out.enriched_stream = std::move(enrich_result.enriched_stream);
     out.enrich_metrics_summary = test_4::format_enrich_summary(enrich_result.summary);
