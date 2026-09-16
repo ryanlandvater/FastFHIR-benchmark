@@ -1527,7 +1527,44 @@ FastFHIR-benchmark: bench-release.yml
         and `bench-results-<platform>.tar.gz`.
       - Rehearsed locally: the gate correctly refused (dirty checkout), and
         every figure rendered as SVG and PNG.
-- [ ] **PB-2d. Prove it end to end on Ryan's Mac.** Needs Ryan:
+- [ ] **PB-2d. Prove it end to end on Ryan's Mac.**
+      - **Quick run: ✅ 2026-09-16**, run
+        [35119129906](https://github.com/ryanlandvater/FastFHIR-benchmark/actions/runs/35119129906).
+        - Green in 7 min on runner `Ryans-MacBook-Pro`. `baseline auto` resolved
+          to `4703c71`, and the run was flagged A/A (identical binaries).
+        - The gate refused it with a single reason, *quick run*.
+        - `benchmark_dirty: false` confirms the `.gitignore` fix works on a
+          real checkout.
+        - Publish was skipped; the artifact carries the notes, both sides and
+          the figures.
+      - Gotcha: the runner needs the **`bench-local` label**. A label added
+        while `run.sh` is running is not seen until `run.sh` is restarted.
+      - Actions warned that `actions/checkout@v4` and `upload-artifact@v4`
+        target the deprecated Node 20. ✅ Bumped to checkout@v7,
+        upload-artifact@v7 and download-artifact@v8 (Node 24; v8 fails on a
+        digest mismatch).
+      - The ladder now reaches **256 MB**. `bench_ab.py` defaults to the
+        harness's own ladder `1,2,4,8,16,32,64,256`, and the workflow has a
+        `targets_mb` input.
+        - Measured on this Mac: one 256 MB replicate (3 runs + 1 warmup) takes
+          58 s, with a 4.9 GB peak footprint. The 256 MB rung therefore costs
+          ≈40 min across both sides.
+      - Full run 1 ([35125924135](https://github.com/ryanlandvater/FastFHIR-benchmark/actions/runs/35125924135))
+        failed in setup: the Mac runner uses `/bin/bash` 3.2, where an empty
+        array is "unbound" under `set -u`. The expansions are now guarded.
+      - Full run 2 ([35126101211](https://github.com/ryanlandvater/FastFHIR-benchmark/actions/runs/35126101211))
+        failed at its first measurement, for two reasons:
+        1. The unquoted `targets_mb` default `1,2,4,8,16,32,64,256` reached
+           the job as `1248163264256`: GitHub's YAML parser dropped the commas
+           and read it as a number.
+        2. The harness then tried to build a 1.2 TB bundle and was killed
+           (SIGKILL) after 56 s.
+
+        The default is now quoted, and `bench_ab.py` rejects any target
+        outside 1..4096 MB. Nothing was measured or published.
+      - Remaining: one **full** run with `publish` on.
+
+      Setup, for reference:
       1. Register a runner with label `bench-local` (Settings → Actions →
          Runners).
       2. Put `BENCH_CORPUS_DIR=/Users/ryanlandvater/GitHub/FastFHIR/build/synthea_fhir_r4`
