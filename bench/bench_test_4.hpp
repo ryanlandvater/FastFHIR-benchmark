@@ -12,6 +12,15 @@
 #if defined(ARM_FASTFHIR)
 #include <FF_Bundle.hpp>
 #include <FF_Ingestor.hpp>
+// APPEND-1 (FastFHIR FF_BundleAppend.hpp) is newer than some revisions the A/B
+// driver pins as a baseline. Detect it rather than require it, so both sides
+// of an A/B still build -- and the pair then measures exactly this change.
+#if __has_include(<FF_BundleAppend.hpp>)
+#include <FF_BundleAppend.hpp>
+#define BENCH_FF_HAS_APPEND1 1
+#else
+#define BENCH_FF_HAS_APPEND1 0
+#endif
 #define BENCH_TEST_4_ENRICH_FN enrich_fastfhir
 #elif defined(ARM_JSON)
 #include <nlohmann/json.hpp>
@@ -75,6 +84,9 @@ struct EnrichMetricsSummary {
   // its update model does to a STORED stream, not from buffer sizes alone.
   std::int64_t bytes_written = -1;
   std::int64_t bytes_overwritten = -1;
+  // First source byte the update rewrote in place, beyond fixed metadata
+  // (headers, footers, one re-pointed slot); -1 when it rewrote none.
+  std::int64_t rewrite_from = -1;
 };
 
 template <typename StreamT>
@@ -125,6 +137,8 @@ inline EnrichResult<StreamType> enrich_fastfhir(const StreamType& payload,
   // Tracked as PA-9.)
   const std::size_t source_bytes_before = payload.view().size();
   StreamType enriched_stream = payload;
+  // Opening a Builder on the sealed stream hydrates the root and rewinds the
+  // write head onto the old checksum block (FastFHIR "Re-open for append").
   const FastFHIR::FF_Builder builder_handle = make_builder(enriched_stream, FHIR_VERSION_R5);
   FastFHIR::Builder& builder = *builder_handle;
 
@@ -137,15 +151,33 @@ inline EnrichResult<StreamType> enrich_fastfhir(const StreamType& payload,
     throw std::runtime_error("test_4::enrich expected Bundle root in FastFHIR stream");
   }
 
-  // The live-stream append the zero-copy claim calls for -- append the new
-  // observation to the entry array and re-seal -- is NOT expressible through
-  // the public API today (CAPI-12, filed 2026-08-26):
-  //   * MutableEntry[n] throws out_of_range past a sealed array's end;
-  //   * insert_at_field refuses an already-assigned slot ("Patching an
-  //     assigned slot risks orphaning elements of the stream");
-  //   * README Example 3's insert_at_field works only on ABSENT fields.
-  // So this stage must re-serialize the bundle root -- which is why the
-  // append delta is O(entry-array) rather than O(observation) (PA-10).
+#if BENCH_FF_HAS_APPEND1
+  // APPEND-1 (PA-10c): read the light entry vector, roll the head back onto
+  // the Bundle.entry array when it is the payload's tail (Test 1 builds it
+  // there, PA-10a), write the Observation where it was, then the N+1 array
+  // after it. The root Bundle stays where it is; only Bundle.entry is
+  // re-pointed.
+  FastFHIR::FF_BundleAppendResult append_result;
+  const FF_Result appended = FastFHIR::FF_BundleAppendEntries(
+      FastFHIR::FF_BundleAppendInfo{
+          .builder = builder_handle,
+          .append =
+              [&](FastFHIR::Builder& b, std::vector<BundleentryData>& new_entries) {
+                auto observation_handle = b.append_obj(ObservationData{});
+                assign::assign_observation(enrichment_observation, observation_handle);
+                new_entries.push_back(
+                    BundleentryData{.resource = static_cast<ResourceReference>(observation_handle)});
+              },
+      },
+      append_result);
+  if (!appended) {
+    throw std::runtime_error("fastfhir arm enrich: " + appended.message);
+  }
+  (void)seal_stream(builder_handle, root_handle, "fastfhir arm enrich");
+#else
+  // Pre-APPEND-1 FastFHIR: the only public path re-serializes the bundle
+  // root -- a new Bundle and a new (N+1) x 84 B entry array, the old array
+  // left unreferenced (PA-10, CAPI-12).
   BundleData bundle = root_node.as<BundleData>();
   auto observation_handle = builder.append_obj(ObservationData{});
   assign::assign_observation(enrichment_observation, observation_handle);
@@ -153,7 +185,7 @@ inline EnrichResult<StreamType> enrich_fastfhir(const StreamType& payload,
 
   auto new_root = builder.append_obj(bundle);
   (void)seal_stream(builder_handle, new_root, "fastfhir arm enrich");
-
+#endif
   const std::int64_t duration_ns = timer.stop_ns();
 
   EnrichMetricsSummary summary;
@@ -161,18 +193,30 @@ inline EnrichResult<StreamType> enrich_fastfhir(const StreamType& payload,
   summary.enriched_bytes = enriched_stream.view().size();
   summary.appended_observations = 1;
   summary.duration_ns = duration_ns;
-  // Append-only past two fixed regions. Opening a Builder on a sealed stream
-  // rewinds the write head onto the old checksum block (FastFHIR
-  // src/FF_Builder.cpp, "Re-open for append"), so the observation overwrites
-  // it; the reseal then stamps the stream header whole. Everything else lands
-  // past the old end. Until APPEND-1, that appended part still carries a fresh
-  // (N+1) x 84 B entry array (PA-10). BENCH_VALIDATE checks this byte for byte.
-  summary.bytes_overwritten =
-      static_cast<std::int64_t>(FF_HEADER::HEADER_SIZE) +
-      static_cast<std::int64_t>(FF_CHECKSUM::HEADER_SIZE);
+  // Every append rewrites two fixed regions: the stream header (the reseal
+  // stamps it whole) and the old 44 B checksum block (the reopen rewinds onto
+  // it). Everything else is either new -- past the old end -- or, under
+  // APPEND-1, one of:
+  //   tail path   the old entry array and its children, [rewrite_from, end),
+  //               plus the 8 B Bundle.entry slot re-pointed at the new array;
+  //   relocation  only that 8 B slot (the old array is left in place).
+  // BENCH_VALIDATE checks this byte for byte.
+  const auto header = static_cast<std::int64_t>(FF_HEADER::HEADER_SIZE);
+  const auto footer = static_cast<std::int64_t>(FF_CHECKSUM::HEADER_SIZE);
+  const auto source = static_cast<std::int64_t>(summary.source_bytes);
+  std::int64_t in_place = footer;
+#if BENCH_FF_HAS_APPEND1
+  const std::int64_t entry_slot = sizeof(Offset);
+  if (append_result.rewrite_from != FF_NULL_OFFSET) {
+    summary.rewrite_from = static_cast<std::int64_t>(append_result.rewrite_from);
+    in_place = source - summary.rewrite_from;  // covers the old footer too
+  }
+  summary.bytes_overwritten = header + entry_slot + in_place;
+#else
+  summary.bytes_overwritten = header + in_place;
+#endif
   summary.bytes_written =
-      static_cast<std::int64_t>(summary.enriched_bytes - summary.source_bytes) +
-      summary.bytes_overwritten;
+      static_cast<std::int64_t>(summary.enriched_bytes) - source + summary.bytes_overwritten;
   return EnrichResult<StreamType>{std::move(enriched_stream), summary};
 }
 

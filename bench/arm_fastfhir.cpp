@@ -28,6 +28,8 @@
 #include "walk_diagnostic.hpp"
 #undef ARM_FASTFHIR
 
+#include "FF_Bundle_internal.hpp"  // FF_BUNDLE::ENTRY, for the BENCH_VALIDATE byte check
+
 namespace bench
 {
   namespace
@@ -644,22 +646,60 @@ namespace bench
         }
       }
       std::fprintf(stderr, "[validate] changed ranges:%s\n", ranges.c_str());
-      // Every changed byte must sit inside the two regions the model counts:
-      // the stream header, or the old checksum block at the source's tail.
+      // Every changed byte must sit inside a region the model counts
+      // (bench_test_4.hpp): the stream header; the old checksum block, or
+      // under APPEND-1 everything from rewrite_from on; and under APPEND-1
+      // the 8 B Bundle.entry slot of the (unmoved) root.
       const std::size_t header_end = static_cast<std::size_t>(FF_HEADER::HEADER_SIZE);
-      const std::size_t footer_begin =
-          pre_enrich.size() - static_cast<std::size_t>(FF_CHECKSUM::HEADER_SIZE);
+      const std::int64_t rewrite_from = enrich_result.summary.rewrite_from;
+      const std::size_t tail_begin =
+          rewrite_from >= 0 ? static_cast<std::size_t>(rewrite_from)
+                            : pre_enrich.size() - static_cast<std::size_t>(FF_CHECKSUM::HEADER_SIZE);
+#if BENCH_FF_HAS_APPEND1
+      const std::size_t root_before = static_cast<std::size_t>(
+          LOAD_U64(reinterpret_cast<const BYTE *>(pre_enrich.data()) + FF_HEADER::ROOT_OFFSET));
+      const std::size_t slot_begin = root_before + static_cast<std::size_t>(FF_BUNDLE::ENTRY);
+      const std::size_t slot_end = slot_begin + sizeof(Offset);
+#else
+      const std::size_t slot_begin = 0, slot_end = 0;
+#endif
       bool within_model = true;
       for (std::size_t i = 0; i < n; ++i)
-        if (pre_enrich[i] != static_cast<char>(v.data()[i]) && i >= header_end && i < footer_begin)
+        if (pre_enrich[i] != static_cast<char>(v.data()[i]) && i >= header_end && i < tail_begin &&
+            !(i >= slot_begin && i < slot_end))
           within_model = false;
       std::fprintf(stderr,
                    "[validate] enrich changed %zu of %zu source bytes (last at %zu); "
                    "reported bytes_overwritten=%lld -- %s\n",
                    changed, pre_enrich.size(), last,
                    static_cast<long long>(enrich_result.summary.bytes_overwritten),
-                   within_model ? "all inside header + old checksum block"
+                   within_model ? "all inside the modelled regions"
                                 : "MISMATCH: bytes changed outside the modelled regions");
+      // The enriched stream must itself be sound, and end with the new entry.
+      {
+        FastFHIR::Parser enriched(payload_memory);
+        const FF_Result er = enriched.validate_FFHR_stream();
+        std::size_t entries = 0;
+        bool last_is_observation = false;
+        if (auto es = enriched.root()[FastFHIR::Fields::BUNDLE::ENTRY])
+        {
+          for (auto &e : es.entries())
+          {
+            ++entries;
+            const auto node = e[FastFHIR::Fields::BUNDLE_ENTRY::RESOURCE].as_node();
+            last_is_observation = node && node.is<FastFHIR::RESOURCETYPE::OBSERVATION>();
+          }
+        }
+        const std::size_t expected = static_cast<std::size_t>(test1_entries) + 1;
+        std::fprintf(stderr,
+                     "[validate] enriched stream: code=%d %s; %zu entries (expected %zu), last is %s\n",
+                     (int)er.code, er.message.c_str(), entries, expected,
+                     last_is_observation ? "an Observation" : "NOT an Observation");
+      }
+      std::fprintf(stderr, "[validate] enrich path: %s (rewrite_from=%lld)\n",
+                   BENCH_FF_HAS_APPEND1 ? (rewrite_from >= 0 ? "APPEND-1 tail rewrite" : "APPEND-1 relocation")
+                                        : "pre-APPEND-1 re-serialize",
+                   static_cast<long long>(rewrite_from));
     }
     out.metrics.push_back(test_4::enrich_metric("fastfhir", enrich_result.summary));
     out.enriched_stream = std::move(enrich_result.enriched_stream);

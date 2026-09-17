@@ -151,6 +151,21 @@ Consequences:
 
 Newest first. One line per change, with what it did and did not settle.
 
+- **2026-09-17** — **PA-10c: APPEND-1 implemented upstream (uncommitted); Test 4 uses it.**
+  - Stream growth per enrich is now a constant 4,619 B, where it was up to
+    2.13 MB at 256 MB. FastFHIR enrich time at 256 MB fell from 0.90 to
+    0.67 ms.
+  - FastFHIR gained `FF_BundleAppendEntries` and `serialize_bundle_array`, plus
+    a unit test checked against its own `StreamMap`. README Example 5 now
+    really attaches its Observation.
+  - Filed upstream: APPEND-2 (map-guided move instead of relocation), E15
+    (pre-existing `ctest -j8` flake in `cpp_test_7/8`), E16 (FastFHIR's own
+    Bazel build fails under Xcode 27).
+  - **Not settled:**
+    - CI can't measure this until FastFHIR's changes are pushed.
+    - The FastFHIR arm's appended Observation is 4.5 KB against JSON's 2.4 KB:
+      a larger block, not overhead from the append.
+
 - **2026-09-16 (evening)** — **PA-10a/b: Bundle written last; enrich storage cost measured.**
   - What changed: the FastFHIR arm now writes resources first and the
     Bundle + entry array last (`BENCH_FF_BUNDLE=backfill` keeps the old
@@ -634,8 +649,37 @@ cross-arm parity mismatch, not a crash.
               append, so its duration includes a memcpy of the source (1.7 ms at
               256 MB) that an append-to-file would not pay. Either append to a
               buffer the arm owns, or report the copy separately.
-        - [ ] **PA-10c.** Test 4 (FF arm): switch to the APPEND-1 sequence once
-              upstream ships it.
+        - [x] **PA-10c. Test 4 (FF arm) uses APPEND-1.** ✅ 2026-09-17
+              - Built against FastFHIR's uncommitted APPEND-1
+                (`FF_BundleAppendEntries`).
+              - `bench_test_4.hpp` detects the API with
+                `__has_include(<FF_BundleAppend.hpp>)` and otherwise falls back to
+                the old re-serialize path. An A/B against a pre-APPEND-1 baseline
+                therefore still builds, and measures exactly this change.
+              - Measured locally (FF arm, 3 replicates × 3 runs, identical
+                bundles):
+
+                | Bundle | Stream growth (before → after) | Enrich time (before → after) |
+                |---:|---|---|
+                | 1 MB | 17,835 → **4,619 B** | 0.013 → 0.012 ms |
+                | 16 MB | 136,107 → **4,619 B** | 0.087 → 0.050 ms |
+                | 64 MB | 606,507 → **4,619 B** | 0.262 → 0.212 ms |
+                | 256 MB | 2,132,115 → **4,619 B** | 0.898 → 0.670 ms |
+
+              - Bytes written are about unchanged: the N × 84 B array is now
+                rewritten in place instead of copied.
+              - `bytes_overwritten` = header 54 + `Bundle.entry` slot 8 +
+                `[rewrite_from, old end)`; a relocation overwrites 54 + 8 + 44.
+              - New `rewrite_from` field in `EnrichMetricsSummary`.
+              - `BENCH_VALIDATE` checks, for both layouts:
+                - the changed bytes lie inside the modelled regions;
+                - the enriched stream validates, with N+1 entries and an
+                  Observation last;
+                - tail layout takes the tail-rewrite path; backfill relocates.
+              - `fig4` now has three panels: **stream growth** (linear axis),
+                bytes written and bytes overwritten (log axes).
+              - **CI needs APPEND-1 pushed upstream first**: the runner pins
+                FastFHIR from GitHub.
               - Framing (Ryan, 2026-09-16): **growth per append is minimal, not
                 zero.** Each append adds one 84 B entry plus the resource,
                 unavoidably, because an entry is being added. That is far less
@@ -1435,7 +1479,7 @@ That is intentional coverage proving the fallback is lossless — **do not enabl
 
 ## ▶ PB — publishable benchmark pipeline
 
-**Status** OPEN · PB-1 ✅ · PB-2a–c, 2e ✅ · PB-2d: full run gate-passed, not yet published · direction agreed with Ryan 2026-09-16 ·
+**Status** OPEN · PB-1 ✅ · PB-2a–c, 2e ✅ · PB-2d: full run gate-passed, not yet published · PA-10a–c ✅ · direction agreed with Ryan 2026-09-16 ·
 cloud: **Google Cloud** (Ryan's preference) · work top to bottom
 
 **Goal.** A FastFHIR release triggers a benchmark of *that* release on
