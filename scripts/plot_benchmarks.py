@@ -472,9 +472,12 @@ def legend_for(fig, arms: list[str], ncol: int = 4) -> None:
 
 
 def fmt_bytes(v: float) -> str:
-    for unit, scale in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+    # Decimal (SI) units, so labels agree with the CSV's byte counts divided by
+    # 10^3 / 10^6 -- and with the round-number ticks matplotlib places. Binary
+    # units put "2.9 KB" ticks on a 1000-step axis and made 2.34 MB read 2.2.
+    for unit, scale in (("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
         if v >= scale:
-            return f"{v / scale:.1f} {unit}"
+            return f"{v / scale:.3g} {unit}"
     return f"{v:.0f} B"
 
 
@@ -661,14 +664,17 @@ def fig_wire_size(df: pd.DataFrame, prov: Provenance, out: Path, exts: list[str]
 
 def fig_enrich_delta(df: pd.DataFrame, prov: Provenance, out: Path, exts: list[str]) -> None:
     """What storing one appended Observation costs (PA-10b/c): how much the
-    stream grows, how many bytes the update writes, and how many of those land
-    on bytes the stream already had.
+    stream grows, and how many bytes the update writes.
 
-    Three panels on one shared arm axis rather than one chart with several
-    scales: all are bytes. Growth alone hid full rewrites; bytes written alone
-    hides that an append-only format and a rewriting one can grow alike.
-    "Overwritten" is zero for an append-only format, which a log axis cannot
-    draw -- so that case is labelled, not plotted.
+    Two panels on one shared arm axis: growth alone hid full rewrites, and
+    bytes written alone hides that an append-only format and a rewriting one
+    can grow alike. (bytes_overwritten stays in the CSV and summary table; it
+    is not charted -- Ryan, 2026-09-17.)
+
+    Both panels are LINEAR. A log axis made a 12x difference in bytes written
+    look like a small one at first glance (Ryan, 2026-09-17); bar length must
+    read as magnitude. Values too small to see as a bar are carried by their
+    labels.
     """
     t4 = df[df["test"] == "test_4_enrich"].copy()
     has_model = {"bytes_written", "bytes_overwritten"} <= set(t4.columns) and \
@@ -682,30 +688,24 @@ def fig_enrich_delta(df: pd.DataFrame, prov: Provenance, out: Path, exts: list[s
     arms = [a for a in ordered_arms(df) if a in set(sub["arm"])]
     growth = [(sub[sub["arm"] == a]["bytes_out"] - sub[sub["arm"] == a]["bytes_in"]).median() for a in arms]
     written = [sub[sub["arm"] == a]["bytes_written"].median() for a in arms]
-    overwritten = [sub[sub["arm"] == a]["bytes_overwritten"].median() for a in arms]
     source = [sub[sub["arm"] == a]["bytes_in"].median() for a in arms]
 
-    fig, axes = plt.subplots(1, 3, figsize=(13.6, 4.6), sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=(10.4, 4.6), sharey=True)
     fig.suptitle(f"Storing one appended Observation ({target} MB target bundle)",
                  fontsize=12, y=0.985, x=0.008, ha="left", color=TEXT_PRIMARY)
     ypos = np.arange(len(arms))
-    # Growth is one order of magnitude across arms, so it is read on a linear
-    # axis (bar length = value); the other two span five, so they need log.
     panels = [
-        (axes[0], growth, "Stream growth", "linear"),
-        (axes[1], written, "Bytes written", "log"),
-        (axes[2], overwritten, "Existing bytes overwritten", "log"),
+        (axes[0], growth, "Stream growth"),
+        (axes[1], written, "Bytes written"),
     ]
-    for ax, values, title, scale in panels:
+    for ax, values, title in panels:
         ax.set_title(title, fontsize=10, loc="left", color=TEXT_PRIMARY)
         drawn = [v if v > 0 else np.nan for v in values]
         ax.barh(ypos, drawn, height=0.45, color=[arm_color(a) for a in arms],
                 edgecolor=SURFACE, linewidth=2)  # 2px surface gap, not a border
-        ax.set_xscale(scale)
-        if scale == "linear":
-            ax.set_xlim(left=0)
-            ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: fmt_bytes(v) if v else "0"))
-        ax.set_xlabel("bytes" if scale == "linear" else "bytes (log scale)")
+        ax.set_xlim(left=0)
+        ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: fmt_bytes(v) if v else "0"))
+        ax.set_xlabel("bytes")
         ax.grid(axis="y", visible=False)
         for spine in ("top", "right", "left"):
             ax.spines[spine].set_visible(False)
@@ -753,13 +753,14 @@ def fig_enrich_delta_legacy(df: pd.DataFrame, prov: Provenance, out: Path, exts:
             edgecolor=SURFACE, linewidth=2)  # 2px surface gap, not a border
     ax.set_yticks(ypos, [arm_label(a) for a in arms])
     ax.invert_yaxis()
-    ax.set_xscale("log")
-    ax.set_xlabel("bytes added (log scale)")
+    ax.set_xlim(left=0)
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: fmt_bytes(v) if v else "0"))
+    ax.set_xlabel("bytes added")
     ax.grid(axis="y", visible=False)
     for spine in ("top", "right", "left"):
         ax.spines[spine].set_visible(False)
     for y, d in zip(ypos, deltas):
-        # Outside the bar end: a label inside a short log-scaled bar would clip.
+        # Outside the bar end: a label inside a short bar would clip.
         ax.annotate(fmt_bytes(d), xy=(d, y), xytext=(6, 0), textcoords="offset points",
                     va="center", fontsize=8, color=TEXT_SECONDARY)
     ax.margins(x=0.18)

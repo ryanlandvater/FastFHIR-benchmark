@@ -676,8 +676,15 @@ cross-arm parity mismatch, not a crash.
                 - the enriched stream validates, with N+1 entries and an
                   Observation last;
                 - tail layout takes the tail-rewrite path; backfill relocates.
-              - `fig4` now has three panels: **stream growth** (linear axis),
-                bytes written and bytes overwritten (log axes).
+              - `fig4` now has two panels, stream growth and bytes written,
+                **both on linear axes**. The overwritten panel was dropped as
+                irrelevant (Ryan, 2026-09-17); `bytes_overwritten` stays in the
+                CSV and in `summary.md`.
+                - Ryan, 2026-09-17: log axes made a 12× gap in bytes written
+                  look small at first glance.
+              - `fmt_bytes` now uses decimal units (KB = 10³, MB = 10⁶), so
+                labels match the CSV and the tick positions (2.34 MB, no longer
+                "2.2 MB").
               - **CI needs APPEND-1 pushed upstream first**: the runner pins
                 FastFHIR from GitHub.
               - Framing (Ryan, 2026-09-16): **growth per append is minimal, not
@@ -1718,6 +1725,17 @@ FastFHIR-benchmark: bench-release.yml
           Either `publish` was not ticked at dispatch, or `publishable` did not
           propagate as a job output. The run API does not expose dispatch
           inputs, so this is unconfirmed.
+      - **Full run 4: ✅ gate passed 2026-09-17**, run
+        [35226827197](https://github.com/ryanlandvater/FastFHIR-benchmark/actions/runs/35226827197),
+        1 h 21 min. This was the first real A/B: FastFHIR `43b6a40` (APPEND-1)
+        vs `ee578e4`, on benchmark `1d46bbc`.
+        - Parity held on every invocation, and the binaries differ.
+        - FastFHIR Test 4 paired ratio: **0.69–0.77 at every size** (256 MB:
+          0.667 vs 0.903 ms).
+        - Stream growth per enrich: **4,619 B at every size**, against 18 KB
+          → 2.34 MB for the baseline.
+        - Tests 1–3 are unchanged (paired medians 0.99–1.02).
+        - Published with `publish` off; the figures carry no provisional stamp.
       - Remaining: publish (re-run with `publish` on, or confirm the output
         propagation).
 
